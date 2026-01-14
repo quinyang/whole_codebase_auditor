@@ -7,3 +7,10 @@ tree-sitter-java
 tree-sitter-go
 pygithub
 dotenv
+torch 
+torchvision
+torchaudio
+transformers
+mamba-ssm
+causal-conv1d
+accelerate
