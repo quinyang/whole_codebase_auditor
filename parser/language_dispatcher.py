@@ -66,7 +66,7 @@ class LanguageDispatcher:
         language_module = importlib.import_module(pkg_name)
         
         # Get Language Object
-        language_obj = Language(language_module.language())
+        language_obj = language_module.language()
         
         # --- THE FIX IS HERE --- 
         # Old API: parser = Parser(); parser.set_language(language_obj)
