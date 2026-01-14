@@ -1,3 +1,23 @@
 When you request a file via the GitHub API, 
 GitHub doesn't send the raw text or binary over the wire because certain characters can break the JSON response. 
 Instead, GitHub encodes the file into Base64 (a text-based string format).
+
+
+
+    # 1. Scan the repository
+    #scanned_results = repo_scan_parser()
+    
+    # 2. Turn list into one giant string
+    #huge_context_string = build_mamba_prompt(scanned_results)
+    
+    # 3. Feed to Mamba (Pseudo-code for Zamba2/Mamba)
+    # import torch
+    # from transformers import AutoTokenizer, AutoModelForCausalLM
+    
+    # tokenizer = AutoTokenizer.from_pretrained("Zyphra/Zamba2-...")
+    # model = AutoModelForCausalLM.from_pretrained("Zyphra/Zamba2-...")
+    
+    # input_ids = tokenizer(huge_context_string, return_tensors="pt").input_ids.to("cuda")
+    # output = model.generate(input_ids, max_new_tokens=500)
+    
+    # print(tokenizer.decode(output[0]))

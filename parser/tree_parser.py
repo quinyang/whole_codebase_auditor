@@ -39,6 +39,12 @@ def repo_scan_parser():
     results = []
 
     for index, item in enumerate(files): 
+
+        # --- OPTIMIZATION: SKIP HUGE FILES EARLY ---
+        # Skip json.hpp or lock files before even checking extensions
+        if "json.hpp" in item.path or "lock" in item.path:
+            print(f"⏭️ Skipping known massive vendor file: {item.path}")
+            continue
         
         # Skip directories (Type 'tree' = folder, 'blob' = file)
         parser, lang = dispatcher.get_parser_for_file(item.path)
@@ -59,6 +65,12 @@ def repo_scan_parser():
             else:
                 code_bytes = blob.content.encode("utf-8")
 
+            try:
+                code_content = code_bytes.decode('utf-8')
+            except UnicodeDecodeError:
+                print(f"⚠️ Skipping binary/non-utf8 file: {item.path}")
+                code_content = "[BINARY DATA SKIPPED]"
+
             # Feed to Tree-sitter (Parser)
             tree = parser.parse(code_bytes)
             root = tree.root_node
@@ -71,10 +83,11 @@ def repo_scan_parser():
             file_data = {
                 "path": item.path,
                 "size": len(code_bytes),
+                "content": code_content,
                 "root_type": root.type,
                 "statements": root.child_count,
                 "has_error": has_error,
-                "tree": tree  # We keep the tree object for the next step
+                #"tree": tree  
             }
             results.append(file_data)
 
@@ -90,12 +103,59 @@ def repo_scan_parser():
     
     return results
 
+def build_mamba_prompt(scanned_files):
+    # --- FIX 1: ACTUAL INSTRUCTIONS RESTORED ---
+    prompt = """<system_state>
+You are the Whole-Codebase Auditor (WCA). 
+Your architecture (Mamba SSM) allows you to view this entire repository as a continuous data stream.
+Analyze the following files for "Action-at-a-Distance" vulnerabilities, such as:
+- Insecure data flows between different modules.
+- API keys or secrets hardcoded in one file and exposed in another.
+- Logic bugs that only appear when multiple files interact.
+</system_state>
+
+<codebase_stream>
+"""
+    for file in scanned_files:
+        # --- FIX 3: SKIP HUGE VENDOR FILES ---
+        # Simple heuristic: skip if filename contains "json.hpp" or is larger than 200KB
+        if "json.hpp" in file["path"] or file["size"] > 200000:
+            print(f"⚠️ Excluding massive file from context: {file['path']}")
+            continue
+
+        if "content" not in file or not file["content"]: 
+            continue
+            
+        prompt += f'\n<file path="{file["path"]}">\n'
+        prompt += file["content"]
+        prompt += f'\n</file>\n'
+
+    prompt += "\n</codebase_stream>"
+    
+    # --- FIX 2: APPEND THE QUERY ---
+    prompt += "\n\nQuery: Identify any cross-file security vulnerabilities in the provided stream."
+    
+    return prompt
+
+
 if __name__ == "__main__":
-    files_endcoding = repo_scan_parser()
-    result_ele = files_endcoding[0]
-    print("\n📦 Quick Result Element Inspection (1st one)")
-    print(f"Key: 'path'              -> {result_ele['path']}")
-    print(f"Key: 'size_bytes'        -> {result_ele['size']}")
-    print(f"Key: 'root_type'         -> {result_ele['root_type']}")
-    print(f"Key: 'child_count'       -> {result_ele['statements']}")
-    print(f"Key: 'tree_object'       -> {result_ele['tree']}")
+    # Run the scan
+    print("🚀 Starting Repo Scan...")
+    scanned_results = repo_scan_parser()
+    
+    print("\n🔗 Stitching Mamba Context...")
+    huge_context_string = build_mamba_prompt(scanned_results)
+        
+    print(f"\n📊 Context Stats:")
+    print(f"   Total Length: {len(huge_context_string):,} characters")
+    
+    # Simple previews
+    print("\n" + "="*50)
+    print("👀 PREVIEW: HEAD")
+    print("="*50)
+    print(huge_context_string[:500])  
+        
+    print("\n" + "="*50)
+    print("👀 PREVIEW: TAIL")
+    print("="*50)
+    print(huge_context_string[-500:])
