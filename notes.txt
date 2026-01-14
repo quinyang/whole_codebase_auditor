@@ -1,0 +1,3 @@
+When you request a file via the GitHub API, 
+GitHub doesn't send the raw text or binary over the wire because certain characters can break the JSON response. 
+Instead, GitHub encodes the file into Base64 (a text-based string format).

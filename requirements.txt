@@ -1,0 +1,9 @@
+tree-sitter
+tree-sitter-python
+tree-sitter-c
+tree-sitter-cpp
+tree-sitter-javascript
+tree-sitter-java
+tree-sitter-go
+pygithub
+dotenv
