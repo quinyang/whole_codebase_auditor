@@ -13,11 +13,12 @@ Improvements over original:
 import os
 import importlib
 import threading
-from typing import Optional, Tuple, Dict, Set, TYPE_CHECKING
-from dataclasses import dataclass
+from typing import Optional, Tuple, Dict, Set, Any, TYPE_CHECKING
 
+# Type checking imports - these don't run at runtime
 if TYPE_CHECKING:
     from tree_sitter import Parser, Language
+from dataclasses import dataclass
 
 
 @dataclass
@@ -132,8 +133,9 @@ class LanguageDispatcher:
     def __init__(self, verbose: bool = True):
         self.verbose = verbose
         self._lock = threading.Lock()
-        self._parsers: Dict[str, "Parser"] = {}
-        self._languages: Dict[str, "Language"] = {}
+        # Using Any for parser/language types due to tree-sitter version differences
+        self._parsers: Dict[str, Any] = {}
+        self._languages: Dict[str, Any] = {}
         self._failed_packages: Set[str] = set()  # Don't retry failed imports
         
         # Build extension -> language mapping
@@ -153,7 +155,7 @@ class LanguageDispatcher:
     
     def get_parser_for_file(
         self, filename: str
-    ) -> Tuple[Optional["Parser"], Optional["Language"]]:
+    ) -> Tuple[Optional[Any], Optional[Any]]:
         """
         Get a (parser, language) tuple for the given filename.
         
@@ -161,6 +163,9 @@ class LanguageDispatcher:
         - File has no extension
         - Extension is not supported
         - Language package failed to load
+        
+        The parser object has a .parse(bytes) method.
+        The language object represents the tree-sitter grammar.
         """
         _, ext = os.path.splitext(filename)
         ext = ext.lower()
@@ -257,7 +262,7 @@ class LanguageDispatcher:
     
     def parse_file(
         self, filename: str, content: bytes
-    ) -> Optional[Tuple[object, bool]]:
+    ) -> Optional[Tuple[Any, bool]]:
         """
         Convenience method: Parse a file and return (tree, has_errors).
         
@@ -267,8 +272,8 @@ class LanguageDispatcher:
         if parser is None:
             return None
         
-        tree = parser.parse(content)  # type: ignore
-        return tree, tree.root_node.has_error  # type: ignore
+        tree = parser.parse(content)
+        return tree, tree.root_node.has_error
 
 
 # Singleton instance for convenience
