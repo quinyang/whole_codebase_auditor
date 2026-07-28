@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wca"
+version = "0.2.0"
+description = "Whole-Codebase Auditor: pure-SSM cross-file security analysis over a linear-time context pass"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Jiakun Yang" }]
+
+# Core deps only. Deliberately excludes torch/transformers so that
+# `pip install wca` works on a CPU box for ingest/parse/graph/pack, and so
+# Colab does not reinstall its own pinned torch build.
+dependencies = [
+    "tree-sitter>=0.25",
+    "tree-sitter-python>=0.23",
+    "tree-sitter-c>=0.23",
+    "tree-sitter-cpp>=0.23",
+    "tree-sitter-javascript>=0.23",
+    "tree-sitter-go>=0.23",
+    "tree-sitter-java>=0.23",
+    "tree-sitter-rust>=0.23",
+]
+
+[project.optional-dependencies]
+# Installed on the GPU host (Colab). torch is intentionally NOT pinned here --
+# Colab ships its own CUDA-matched build and reinstalling it breaks the runtime.
+gpu = [
+    "transformers>=4.46",
+    "accelerate>=1.0",
+    "bitsandbytes>=0.44",
+    "sentencepiece",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+wca = "wca.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["wca*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# BLE001: broad excepts are deliberate here -- a single unparseable file or a
+# missing grammar must degrade the scan, never abort it. Both sites record the
+# error and continue; that was the original bug.
+ignore = ["BLE001"]

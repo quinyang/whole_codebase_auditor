@@ -1,6 +1,18 @@
-# Python
-venv/
 __pycache__/
-*.pyc
-
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
 .env
+.ipynb_checkpoints/
+.ruff_cache/
+.pytest_cache/
+
+# WCA run artifacts
+.wca_cache/
+runs/
+*.pack.txt
+*.manifest.json
+*.findings.json
