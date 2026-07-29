@@ -92,6 +92,27 @@ def select_dtype():
     return torch.float16, name
 
 
+def free_gpu() -> None:
+    """Drop unreferenced models and empty the CUDA caching allocator.
+
+    Notebook-specific hazard: `auditor = MambaAuditor()` rebinds the name but the
+    old model stays alive until GC runs, and even then torch's caching allocator
+    holds the freed blocks. Re-running a load cell therefore silently doubles
+    VRAM use. This makes the reclaim explicit.
+    """
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except ImportError:
+        pass
+
+
 def fast_path_available() -> bool:
     """True if a fused selective-scan kernel is importable.
 
@@ -218,8 +239,38 @@ class MambaAuditor:
         else:
             kwargs["torch_dtype"] = self.dtype
 
+        # A previously-loaded model in the same process still owns its VRAM;
+        # rebinding `auditor = MambaAuditor()` in a notebook does NOT free it.
+        # Re-running a cell therefore loads a second copy and OOMs at generate
+        # time with a confusingly small allocation request.
+        free_gpu()
+
         self.model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
         self.model.eval()
+        self._report_footprint()
+
+    def _report_footprint(self) -> None:
+        """Print actual VRAM use, so a silently-unquantised load is obvious."""
+        import torch
+
+        params = sum(p.numel() * p.element_size() for p in self.model.parameters())
+        line = f"[wca] weights {params / 2**30:.2f} GiB"
+        if torch.cuda.is_available():
+            alloc = torch.cuda.memory_allocated() / 2**30
+            free, total = (x / 2**30 for x in torch.cuda.mem_get_info())
+            line += f" | allocated {alloc:.2f} GiB | free {free:.2f}/{total:.2f} GiB"
+            if alloc > 8.0:
+                line += (
+                    "\n[wca] WARNING: that is far more than a 4-bit 7B (~6 GiB). Either "
+                    "quantisation\n       did not apply (is bitsandbytes installed?) or an "
+                    "older model is still\n       resident. Restart the runtime."
+                )
+        print(line)
+
+    def free(self) -> None:
+        """Release the model and empty the CUDA cache."""
+        self.model = None
+        free_gpu()
 
     # ---- prompting ---------------------------------------------------------
 
