@@ -98,9 +98,57 @@ chars-per-token estimate. This week makes the numbers real.
 *Done when:* a prefill-time-vs-context-length curve exists, and the default
 budget is justified by measurement.
 
-**Risk:** a 24k prefill on a T4 eager path may take long enough to be painful.
-Mitigation in priority order — drop to 16k; move to an L4 (Colab Pro); only then
-consider pinned prebuilt kernels.
+### Finding (first GPU run): the eager path is linear in *memory*, not just time
+
+A 24k-token audit OOM'd on a T4 trying to allocate 10.92 GiB in a single tensor.
+The cause is architectural, not a config mistake:
+
+```python
+# FalconMambaMixer.slow_forward
+discrete_A = torch.exp(A[None, :, None, :] * discrete_time_step[:, :, :, None])
+# shape [batch, intermediate_size, seq_len, ssm_state_size], fp32
+```
+
+Without a fused kernel, transformers **materialises the discretised recurrence
+for every timestep at once** rather than scanning it. So activation memory is
+*linear in context length*:
+
+```
+intermediate(8192) × state(16) × 4 bytes = 0.5 MiB per token per tensor
+~3 live tensors                          ≈ 1.5 MiB per token
+```
+
+Predicted 10.74 GiB at 21,986 tokens vs. 10.92 GiB observed — a 2% match, so the
+mechanism is confirmed. A 24k context wants ~36 GiB of activations and **cannot
+fit on a 16 GB card at any quantisation**, because this is activation memory, not
+weights. 4-bit does nothing for it.
+
+**This sharpens the project's thesis rather than damaging it.** The O(1)-state
+property of an SSM is a claim about the *algorithm*; the reference implementation
+doesn't deliver it. The fused `selective_scan` kernel is what makes it real — it
+runs the scan in SRAM and never allocates the `seq_len` dimension. That is a
+measured, defensible systems result, and a better week-2 deliverable than the
+prefill-time curve alone.
+
+Guardrails added to `infer.py`: `slow_path_bytes_per_token()`,
+`estimate_max_context()`, and a fail-fast check in `generate()` so this surfaces
+before a 3-minute model load instead of after.
+
+**Revised week-2 order:**
+
+1. Budget 4,000, eager path — prove the pipeline end-to-end today.
+2. `pip install kernels` (HF's on-demand prebuilt FalconMamba kernels — this is
+   what the transformers warning recommends, and it avoids the `mamba-ssm`
+   source build entirely). Verify with `fast_path_available()`.
+3. If the kernel loads, re-measure the ceiling — it should jump by roughly an
+   order of magnitude, and *that delta is the headline measurement*.
+4. If it doesn't support sm_75 (T4 is Turing; the fused kernels commonly target
+   sm_80+), either move to an L4 runtime or report the T4 ceiling honestly and
+   run the budget sweep within it.
+
+Plot **both** curves — memory vs. context length, with and without kernels. Two
+lines, one flat-ish and one steep, is the single best artifact this project can
+produce for an interview.
 
 ## Week 3 — output quality
 

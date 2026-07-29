@@ -300,10 +300,44 @@ git push origin rework:main
 
 ## Step 1 — Run it locally, no GPU (10 min)
 
+**Make an environment first.** `pip install -e .` installs into whatever Python is
+active, and if your prompt says `(base)` that's conda's base environment — the one
+everything else on your machine also uses. Check before installing:
+
 ```bash
+which python && which pip     # if this says .../anaconda3/bin, you're in base
+```
+
+Create a dedicated env:
+
+```bash
+conda create -n wca python=3.11 -y
+conda activate wca            # prompt should now read (wca), not (base)
+```
+
+Python 3.11 on purpose: the project needs ≥3.10, and 3.11 has the widest
+prebuilt-wheel coverage for the tree-sitter grammars, so pip won't fall back to a
+source build. A plain venv works identically if you prefer project-local
+(`python -m venv .venv && source .venv/bin/activate`; `.venv/` is already
+gitignored).
+
+Now install and test:
+
+```bash
+cd ~/Documents/"Cowork Playground"/whole_codebase_auditor
 pip install -e ".[dev]"
 pytest -q                       # expect: 31 passed
 ```
+
+> **If you already installed into base by mistake**, undo it there:
+> ```bash
+> pip uninstall -y wca
+> pip uninstall -y tree-sitter tree-sitter-python tree-sitter-c tree-sitter-cpp \
+>                  tree-sitter-javascript tree-sitter-go tree-sitter-java tree-sitter-rust
+> python -c "import wca"        # expect ModuleNotFoundError
+> rm -rf wca.egg-info build     # editable-install leftovers (gitignored)
+> ```
+> `pytest` and `ruff` are worth keeping in base; they're harmless.
 
 Now scan something real:
 

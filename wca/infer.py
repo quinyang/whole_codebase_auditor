@@ -92,6 +92,68 @@ def select_dtype():
     return torch.float16, name
 
 
+def fast_path_available() -> bool:
+    """True if a fused selective-scan kernel is importable.
+
+    Without one, transformers falls back to `slow_forward`, which changes the
+    memory characteristics of the model completely -- see
+    `slow_path_bytes_per_token`.
+    """
+    for mod in ("mamba_ssm", "causal_conv1d"):
+        try:
+            __import__(mod)
+        except ImportError:
+            return False
+    return True
+
+
+def slow_path_bytes_per_token(model) -> int:
+    """Activation bytes per context token on the eager (non-kernel) path.
+
+    This is the single most important number for running on a small GPU, and it
+    is not obvious from the architecture. `FalconMambaMixer.slow_forward` builds
+
+        discrete_A = exp(A[None,:,None,:] * dt[:,:,:,None])
+        # shape [batch, intermediate_size, seq_len, ssm_state_size], fp32
+
+    i.e. it materialises the discretised recurrence for **every timestep at
+    once** instead of scanning. So activation memory is *linear in context
+    length*, not O(1) in state as the SSM formulation promises. For
+    Falcon3-Mamba-7B (intermediate 8192, state 16, fp32) that is
+
+        8192 * 16 * 4 = 524,288 bytes = 0.5 MiB per token, per tensor
+
+    and `slow_forward` holds roughly three such tensors live (discrete_A,
+    discrete_B, deltaB_u), so ~1.5 MiB/token. A 24k context therefore wants
+    ~36 GiB of activations and cannot fit on a 16 GB card at any quantisation --
+    quantising the *weights* does nothing here, because this is activation
+    memory.
+
+    The fused `selective_scan` kernel is precisely what avoids materialising
+    this: it runs the scan in SRAM and never allocates the seq_len dimension.
+    That is what makes the O(1)-state claim real in practice.
+    """
+    cfg = model.config
+    hidden = getattr(cfg, "hidden_size", 4096)
+    intermediate = getattr(cfg, "intermediate_size", None) or int(
+        hidden * getattr(cfg, "expand", 2)
+    )
+    state = getattr(cfg, "state_size", 16)
+    n_live_tensors = 3
+    return intermediate * state * 4 * n_live_tensors
+
+
+def estimate_max_context(model, *, safety: float = 0.8) -> int:
+    """Largest context that fits in free VRAM on the eager path."""
+    import torch
+
+    if not torch.cuda.is_available():
+        return MODEL_MAX_CONTEXT
+    free, _total = torch.cuda.mem_get_info()
+    per_token = slow_path_bytes_per_token(model)
+    return max(int(free * safety / per_token), 512)
+
+
 def describe_environment() -> str:
     try:
         import torch
@@ -107,7 +169,15 @@ def describe_environment() -> str:
             __import__(mod)
             lines.append(f"{mod}: present (fast kernels)")
         except ImportError:
-            lines.append(f"{mod}: absent (eager path -- correct, slower)")
+            lines.append(f"{mod}: absent (eager path)")
+    if not fast_path_available():
+        lines.append(
+            "\nNOTE: without fused kernels transformers uses `slow_forward`, which\n"
+            "materialises a [batch, intermediate, seq_len, state] tensor -- activation\n"
+            "memory is LINEAR in context length (~1.5 MiB/token for a 7B Mamba).\n"
+            "Weight quantisation does not help; this is activation memory.\n"
+            "Try `pip install kernels` first, and keep the budget small until it works."
+        )
     return "\n".join(lines)
 
 
@@ -179,6 +249,29 @@ class MambaAuditor:
                 f"[wca] WARNING: {n_prompt:,} tokens exceeds the model's trained "
                 f"{MODEL_MAX_CONTEXT:,} context. Lower --budget."
             )
+
+        # Fail fast rather than OOMing several minutes into a prefill. On the
+        # eager path activation memory is linear in context length, so the real
+        # ceiling is usually far below the model's trained 32k.
+        if not fast_path_available() and torch.cuda.is_available():
+            safe = estimate_max_context(self.model)
+            if n_prompt > safe:
+                per_tok = slow_path_bytes_per_token(self.model) / 2**20
+                need = n_prompt * per_tok / 1024
+                free = torch.cuda.mem_get_info()[0] / 2**30
+                raise RuntimeError(
+                    f"Context of {n_prompt:,} tokens will not fit.\n"
+                    f"  No fused kernel -> transformers uses slow_forward, which "
+                    f"materialises a [batch, intermediate, seq_len, state] tensor.\n"
+                    f"  Activation cost ~{per_tok:.2f} MiB/token -> "
+                    f"~{need:.1f} GiB needed, {free:.1f} GiB free.\n"
+                    f"  Fixes, in order:\n"
+                    f"    1. budget_tokens<={safe:,} (proves the pipeline now)\n"
+                    f"    2. pip install kernels   (fused kernels, no source build)\n"
+                    f"    3. an L4/A100 runtime instead of a T4\n"
+                    f"  Note: 4-bit quantisation does NOT help -- this is "
+                    f"activation memory, not weights."
+                )
 
         t0 = time.perf_counter()
         with torch.inference_mode():
