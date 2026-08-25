@@ -1,0 +1,30 @@
+{
+  "repo": "toy_vuln",
+  "purpose": "Smallest repo that exercises the cross-file claim. Used for the first end-to-end audit, where the point is proving the pipeline runs -- not measuring detection rate.",
+  "n_files": 4,
+  "planted": [
+    {
+      "id": "cred_leak",
+      "category": "hardcoded_secret",
+      "severity": "critical",
+      "definition": { "file": "lib/config.py", "line": 6, "code": "DB_PASSWORD = \"admin_password_123\"" },
+      "use": { "file": "app/handlers.py", "line": 17, "code": "logger.info(\"connecting with %s / %s\", get_conn_string(), DB_PASSWORD)" },
+      "why_cross_file": "The credential is defined in lib/config.py and written to logs in app/handlers.py. Neither file alone shows the leak.",
+      "requires_files": ["lib/config.py", "app/handlers.py"]
+    },
+    {
+      "id": "sql_injection",
+      "category": "injection",
+      "severity": "high",
+      "source": { "file": "app/handlers.py", "line": 23, "code": "table = request.args.get(\"table\")" },
+      "sink": { "file": "lib/db.py", "line": 12, "code": "cur.execute(sql)" },
+      "why_cross_file": "Untrusted input enters in app/handlers.py and reaches an unparameterised execute() in lib/db.py via execute_raw().",
+      "requires_files": ["app/handlers.py", "lib/db.py"]
+    }
+  ],
+  "not_planted": [
+    "app/util.py contains no vulnerability. A finding against it is a false positive.",
+    "lib/db.py execute_safe() is correctly parameterised. Flagging it is a false positive."
+  ],
+  "notes": "Line numbers are 1-indexed and refer to the files as committed. If you edit the fixture, update them -- the grounding check compares against these."
+}
