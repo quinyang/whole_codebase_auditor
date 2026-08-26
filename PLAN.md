@@ -134,6 +134,40 @@ Guardrails added to `infer.py`: `slow_path_bytes_per_token()`,
 `estimate_max_context()`, and a fail-fast check in `generate()` so this surfaces
 before a 3-minute model load instead of after.
 
+### MEASURED (session 2, `pallets/click`, Tesla T4, eager path)
+
+| budget | context | peak VRAM | JSON | findings | grounded |
+|---|---|---|---|---|---|
+| 2,000 | 1,400 tok | 6.68 GiB | yes | 1 | 0 |
+| 4,000 | 2,366 tok | 8.32 GiB | yes | 1 | 0 |
+| 8,000 | 6,386 tok | — | refused by guard | — | — |
+| 16,000 | 14,355 tok | — | refused by guard | — | — |
+
+Two points give a clean two-term memory model:
+
+```
+peak_GiB = 4.30 + 1.74 MiB/token x context
+           ^^^^   ^^^^
+           weights (4-bit working)
+                  activations, linear in context
+```
+
+Predicted 1.5 MiB/token from reading `slow_forward`; **measured 1.74** — a 16%
+match, and the intercept lands on the 4.26 GiB the failed rows reported for
+weights alone. The eager-path memory finding is now quantitative rather than
+inferred.
+
+**Ceiling on a 16 GB T4: ~6,000 tokens.** That is the binding constraint on the
+whole project — below what a 76-file repo needs even in signature form (the
+packer omitted 72–74 of 76 files at these budgets). Not an algorithmic limit; a
+hardware-plus-implementation one.
+
+**Open: grounding rate is 0% on a real repo** despite valid JSON and sensible
+findings, where the toy fixture grounds fine. `closest_line()` diagnostics were
+added to distinguish the two possible causes — a near-miss (model paraphrasing
+real code, so tighten the prompt) versus no close match (model citing a file the
+packer omitted). Re-run the sweep to read which.
+
 **Revised week-2 order:**
 
 1. Budget 4,000, eager path — prove the pipeline end-to-end today.

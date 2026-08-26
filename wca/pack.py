@@ -161,6 +161,31 @@ class PackedContext:
                     best = (ratio, offset)
         return self.resolve(best[1]) if best else None
 
+    def closest_line(self, snippet: str) -> tuple[str, int, float, str] | None:
+        """Best-matching stream line for a snippet: (path, line, ratio, text).
+
+        Diagnostic for ungrounded findings. "0% grounded" is not actionable on
+        its own -- a near-miss at ratio 0.8 means the model paraphrased a real
+        line and the threshold is too tight, while a best match at 0.2 means it
+        invented the evidence outright. Those need opposite responses.
+        """
+        s = _normalise_code(snippet.strip().strip("`"))
+        if len(s) < 4:
+            return None
+        best: tuple[float, int, str] | None = None
+        for offset, norm_line in self._normalised_lines():
+            if len(norm_line) < 4:
+                continue
+            ratio = SequenceMatcher(None, s, norm_line).ratio()
+            if best is None or ratio > best[0]:
+                best = (ratio, offset, norm_line)
+        if best is None:
+            return None
+        resolved = self.resolve(best[1])
+        if resolved is None:
+            return None
+        return resolved[0], resolved[1], round(best[0], 3), best[2][:100]
+
     def _normalised_lines(self) -> list[tuple[int, str]]:
         """[(offset_of_line_start, normalised_text)] over the packed stream."""
         if self._norm_cache is None:

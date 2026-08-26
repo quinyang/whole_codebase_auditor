@@ -53,6 +53,7 @@ class SweepRow:
     error: str = ""
     raw_output: str = field(default="", repr=False)
     findings: list[Finding] = field(default_factory=list, repr=False)
+    ungrounded: list[dict[str, Any]] = field(default_factory=list, repr=False)
 
     @property
     def grounding_rate(self) -> float:
@@ -128,6 +129,21 @@ def audit_once(
     row.n_findings = len(findings)
     row.n_grounded = sum(f.grounded for f in findings)
     row.n_cross_file = sum(f.grounded and f.is_cross_file for f in findings)
+
+    # Why did anything fail to ground? A near-miss and a fabrication both
+    # show up as 0%, and they need opposite fixes.
+    for f in findings:
+        if f.grounded or not f.evidence:
+            continue
+        near = packed.closest_line(f.evidence)
+        row.ungrounded.append(
+            {
+                "evidence": f.evidence[:120],
+                "closest": f"{near[0]}:{near[1]}" if near else None,
+                "ratio": near[2] if near else 0.0,
+                "closest_text": near[3] if near else "",
+            }
+        )
     return row
 
 
@@ -235,19 +251,49 @@ def _interpret(rows: list[SweepRow]) -> None:
     if grounded:
         best = max(grounded, key=lambda r: r.grounding_rate)
         worst = min(grounded, key=lambda r: r.grounding_rate)
-        print(f"  Grounding rate ranges {worst.grounding_rate:.0%} "
-              f"(at {worst.prompt_tokens:,} tok) to {best.grounding_rate:.0%} "
-              f"(at {best.prompt_tokens:,} tok).")
+        if best.grounding_rate == worst.grounding_rate:
+            print(f"  Grounding rate flat at {best.grounding_rate:.0%} across all budgets.")
+        else:
+            print(f"  Grounding rate {worst.grounding_rate:.0%} at {worst.prompt_tokens:,} tok "
+                  f"-> {best.grounding_rate:.0%} at {best.prompt_tokens:,} tok.")
         if best.grounding_rate - worst.grounding_rate > 0.25:
-            print("  -> a clear degradation with context length. This IS the headline")
-            print("     result: recall of exact detail decays as SSM state fills.")
+            print("  -> a clear degradation with context length: recall of exact")
+            print("     detail decays as SSM state fills.")
 
-    if len(ok) >= 3:
-        a, b = ok[0], largest
+    diags = [d for r in ok for d in r.ungrounded]
+    if diags:
+        print("\n  WHY FINDINGS DID NOT GROUND (closest line in the stream):")
+        for d in diags[:6]:
+            print(f"    ratio {d['ratio']:.2f}  said: {d['evidence'][:70]!r}")
+            print(f"                 near: {d['closest']} {d['closest_text'][:66]!r}")
+        top = max(d['ratio'] for d in diags)
+        if top >= 0.6:
+            print("    -> near-misses: the model is paraphrasing real code. Tighten the")
+            print("       prompt ('copy the line character-for-character'), not the matcher.")
+        else:
+            print("    -> no close match: the model is describing code rather than quoting")
+            print("       it. Most likely it cited a file the packer OMITTED -- check the")
+            print("       omit column; at these budgets most of the repo is not in context.")
+
+    if len(ok) >= 2:
+        a, b = min(ok, key=lambda r: r.prompt_tokens), largest
         if a.prompt_tokens and b.prompt_tokens > a.prompt_tokens:
-            gib_per_tok = (b.peak_gib - a.peak_gib) / (b.prompt_tokens - a.prompt_tokens)
-            print(f"  Memory slope: {gib_per_tok * 2**20:.2f} MiB/token "
-                  f"(~1.5 expected on the eager path; near 0 means fused kernels).")
+            per_tok = (b.peak_gib - a.peak_gib) / (b.prompt_tokens - a.prompt_tokens)
+            weights = b.peak_gib - per_tok * b.prompt_tokens
+            print("\n  MEMORY MODEL (the headline measurement):")
+            print(f"    peak_GiB = {weights:.2f} + {per_tok * 1024:.2f} MiB/token x context")
+            print(f"    intercept {weights:.2f} GiB = model weights "
+                  f"({'4-bit working' if weights < 6 else 'NOT quantised?'})")
+            print(f"    slope {per_tok * 1024:.2f} MiB/token = activations. Near 0 would mean")
+            print("      fused kernels; a linear slope is the eager path materialising")
+            print("      [batch, d_inner, seq_len, d_state].")
+            try:
+                import torch
+                total = torch.cuda.get_device_properties(0).total_memory / 2**30
+                ceiling = int((total * 0.92 - weights) / per_tok)
+                print(f"    => ceiling on this {total:.1f} GiB GPU: ~{ceiling:,} tokens")
+            except Exception:  # noqa: S110 -- GPU total is a nice-to-have
+                pass
 
 
 def run_demo(auditor=None, *, budget: int = 4_000, max_new_tokens: int = 512) -> SweepRow:
