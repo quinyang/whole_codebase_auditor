@@ -301,6 +301,41 @@ def test_resolve_snippet_grounds_real_evidence_lines(built):
     assert p.resolve_snippet("this text is not in the repo at all") is None
 
 
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        'DB_PASSWORD = "admin_password_123"',  # exact
+        "DB_PASSWORD = 'admin_password_123'",  # quote style swapped
+        '`DB_PASSWORD = "admin_password_123"`',  # markdown backticks
+        "DB_PASSWORD = “admin_password_123”",  # smart quotes
+        'DB_PASSWORD   =   "admin_password_123"',  # whitespace reflowed
+    ],
+)
+def test_grounding_survives_model_requoting(built, evidence):
+    """Regression: a model re-quoting a line with different quote style is still
+    quoting real code. Exact substring matching alone scored correct findings as
+    hallucinations, which is the expensive direction to get wrong."""
+    _, parsed, g = built
+    p = pack(parsed.files, g, budget_tokens=32_000)
+    assert p.resolve_snippet(evidence) == ("lib/config.py", 3)
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "os.system(user_input)  # nowhere in this repo",
+        "subprocess.call(shell=True, cmd=user_data)",
+        "return None",  # too generic to be evidence
+        "   ",
+    ],
+)
+def test_grounding_still_rejects_hallucinations(built, evidence):
+    """Loosening the match must not make grounding meaningless."""
+    _, parsed, g = built
+    p = pack(parsed.files, g, budget_tokens=32_000)
+    assert p.resolve_snippet(evidence) is None
+
+
 def test_resolve_rejects_out_of_range_offsets(built):
     _, parsed, g = built
     p = pack(parsed.files, g, budget_tokens=16_000)

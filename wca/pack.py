@@ -29,8 +29,10 @@ from __future__ import annotations
 
 import bisect
 import json
+import re
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field
+from difflib import SequenceMatcher
 
 from wca.graph import SymbolGraph
 from wca.parse import ParsedFile
@@ -43,6 +45,17 @@ CHARS_PER_TOKEN = 3.5
 FULL = "full"
 SIGNATURE = "signature"
 OMITTED = "omitted"
+
+_QUOTES = str.maketrans({'"': "'", "“": "'", "”": "'", "‘": "'", "’": "'"})
+
+
+def _normalise_code(line: str) -> str:
+    """Collapse the differences a model introduces when re-quoting a line.
+
+    Quote style, smart quotes, markdown backticks and whitespace are all things
+    a model changes freely while still faithfully quoting real code.
+    """
+    return re.sub(r"\s+", " ", line.translate(_QUOTES).replace("`", "")).strip()
 
 
 @dataclass
@@ -75,6 +88,7 @@ class PackedContext:
 
     def __post_init__(self) -> None:
         self._starts = [s.char_start for s in self.segments]
+        self._norm_cache: list[tuple[int, str]] | None = None
 
     def resolve(self, offset: int) -> tuple[str, int] | None:
         """Map a character offset in `text` back to (path, 1-indexed line)."""
@@ -95,15 +109,68 @@ class PackedContext:
         newlines = self.text.count("\n", seg.char_start, seg.char_start + local)
         return seg.path, seg.line_start + newlines + 1
 
-    def resolve_snippet(self, snippet: str) -> tuple[str, int] | None:
-        """Locate a literal snippet the model quoted back, then resolve it."""
-        s = snippet.strip()
+    def resolve_snippet(self, snippet: str, *, min_ratio: float = 0.85) -> tuple[str, int] | None:
+        """Locate a snippet the model quoted back, then resolve it to (path, line).
+
+        Exact substring matching is too brittle to be the only strategy. Models
+        reliably re-emit a line with the quote style swapped, wrapped in
+        markdown backticks, or with whitespace reflowed -- all of which are
+        faithful quotations of real code that a `str.find` rejects. Grounding is
+        what separates a real finding from a hallucination, so a false negative
+        here is expensive: it silently reclassifies correct work as invented.
+
+        Four passes, most trustworthy first:
+          1. exact substring
+          2. exact match of any single line of the snippet
+          3. normalised match (quotes unified, whitespace collapsed, backticks
+             stripped) against normalised stream lines
+          4. fuzzy match above `min_ratio`, longest normalised line first
+
+        Pass 4 is deliberately gated: a genuine hallucination shares almost no
+        structure with any real line and scores far below the threshold.
+        """
+        s = snippet.strip().strip("`").strip()
         if not s:
             return None
+
         idx = self.text.find(s)
-        if idx == -1 and "\n" in s:
-            idx = self.text.find(s.splitlines()[0].strip())
-        return self.resolve(idx) if idx != -1 else None
+        if idx != -1:
+            return self.resolve(idx)
+
+        lines = [ln.strip().strip("`").strip() for ln in s.splitlines()]
+        lines = [ln for ln in lines if len(ln) >= 4]
+        for ln in lines:
+            idx = self.text.find(ln)
+            if idx != -1:
+                return self.resolve(idx)
+
+        targets = [_normalise_code(ln) for ln in lines]
+        targets = [t for t in targets if len(t) >= 6]
+        if not targets:
+            return None
+
+        best: tuple[float, int] | None = None
+        for offset, norm_line in self._normalised_lines():
+            if len(norm_line) < 6:
+                continue
+            for t in targets:
+                if t == norm_line or (len(t) >= 12 and t in norm_line):
+                    return self.resolve(offset)
+                ratio = SequenceMatcher(None, t, norm_line).ratio()
+                if ratio >= min_ratio and (best is None or ratio > best[0]):
+                    best = (ratio, offset)
+        return self.resolve(best[1]) if best else None
+
+    def _normalised_lines(self) -> list[tuple[int, str]]:
+        """[(offset_of_line_start, normalised_text)] over the packed stream."""
+        if self._norm_cache is None:
+            cache: list[tuple[int, str]] = []
+            offset = 0
+            for line in self.text.splitlines(keepends=True):
+                cache.append((offset, _normalise_code(line)))
+                offset += len(line)
+            self._norm_cache = cache
+        return self._norm_cache
 
     def manifest(self) -> dict:
         return {
