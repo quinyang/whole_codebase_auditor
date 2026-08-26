@@ -10,7 +10,9 @@ Run: pytest -q
 from __future__ import annotations
 
 import io
+import json
 import tarfile
+import tempfile
 
 import pytest
 
@@ -399,3 +401,96 @@ def test_real_evidence_is_grounded_to_file_and_line(built):
     assert f.grounded
     assert f.location == "lib/config.py:3"
     assert f.is_cross_file
+
+
+# --------------------------------------------------------------------------- #
+# fixture + sweep (CPU-testable parts)
+# --------------------------------------------------------------------------- #
+
+
+def test_embedded_fixture_matches_disk():
+    """wca/fixtures.py is generated from eval/fixtures/toy_vuln; keep them in sync."""
+    import pathlib
+
+    from wca.fixtures import GROUND_TRUTH, TOY_VULN
+
+    root = pathlib.Path(__file__).parent.parent / "eval" / "fixtures" / "toy_vuln"
+    if not root.exists():  # installed as a wheel, no eval/ dir
+        pytest.skip("source checkout only")
+    on_disk = {
+        p.relative_to(root).as_posix(): p.read_text()
+        for p in root.rglob("*")
+        if p.is_file() and p.name != "GROUND_TRUTH.json"
+    }
+    assert TOY_VULN == on_disk, "regenerate wca/fixtures.py from eval/fixtures/toy_vuln"
+    assert json.loads((root / "GROUND_TRUTH.json").read_text()) == GROUND_TRUTH
+
+
+def test_ground_truth_line_numbers_are_exact():
+    """A wrong line number here silently corrupts every score."""
+    from wca.fixtures import GROUND_TRUTH, materialise_toy_vuln
+
+    root = materialise_toy_vuln(tempfile.mkdtemp())
+    for planted in GROUND_TRUTH["planted"]:
+        for key in ("definition", "use", "source", "sink"):
+            if key not in planted:
+                continue
+            spot = planted[key]
+            actual = (root / spot["file"]).read_text().splitlines()[spot["line"] - 1].strip()
+            assert spot["code"].strip() in actual or actual in spot["code"].strip(), (
+                f"{spot['file']}:{spot['line']} is {actual!r}, expected {spot['code']!r}"
+            )
+
+
+def test_toy_fixture_graph_finds_both_planted_chains():
+    from wca.fixtures import materialise_toy_vuln
+
+    root = materialise_toy_vuln(tempfile.mkdtemp())
+    parsed = parse_files(from_local(root).files, LanguageDispatcher())
+    g = build_graph(parsed.files)
+    edges = {(e.src, e.dst) for e in g.edges}
+    assert ("app/handlers.py", "lib/config.py") in edges  # credential leak
+    assert ("app/handlers.py", "lib/db.py") in edges  # taint -> sink
+
+
+def test_toy_fixture_evidence_lines_all_ground():
+    """Every planted line must resolve through the manifest, or scoring is broken."""
+    from wca.fixtures import GROUND_TRUTH, materialise_toy_vuln
+
+    root = materialise_toy_vuln(tempfile.mkdtemp())
+    parsed = parse_files(from_local(root).files, LanguageDispatcher())
+    g = build_graph(parsed.files)
+    p = pack(parsed.files, g, budget_tokens=8_000, repo_name="toy_vuln")
+    assert "GROUND_TRUTH" not in p.text, "answer key must not reach the model"
+    for planted in GROUND_TRUTH["planted"]:
+        for key in ("definition", "use", "source", "sink"):
+            if key not in planted:
+                continue
+            spot = planted[key]
+            assert p.resolve_snippet(spot["code"]) == (spot["file"], spot["line"])
+
+
+def test_audit_once_records_oom_instead_of_raising():
+    """A failing budget must become a data point, not kill the sweep."""
+    from wca.fixtures import materialise_toy_vuln
+    from wca.sweep import audit_once
+
+    root = materialise_toy_vuln(tempfile.mkdtemp())
+    parsed = parse_files(from_local(root).files, LanguageDispatcher())
+    g = build_graph(parsed.files)
+
+    class FakeTokenizer:
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [0] * (len(text) // 4)}
+
+    class Boom:
+        tokenizer = FakeTokenizer()
+
+        def generate(self, *a, **k):
+            raise RuntimeError("CUDA out of memory. Tried to allocate 10.92 GiB")
+
+    row = audit_once(Boom(), parsed.files, g, 4_000, repo_name="toy")
+    assert row.error.startswith("RuntimeError")
+    assert "out of memory" in row.error
+    assert row.n_findings == 0
+    assert row.grounding_rate == 0.0
