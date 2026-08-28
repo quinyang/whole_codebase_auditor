@@ -11,6 +11,7 @@ finding is a hallucination by construction, and the eval must say so.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from dataclasses import asdict, dataclass, field
@@ -60,55 +61,178 @@ class Finding:
         )
 
 
-def extract_json_array(text: str) -> list[dict]:
-    """Pull the first well-formed JSON array out of model output.
+def _loads_lenient(blob: str) -> object | None:
+    """Parse one JSON-ish value, tolerating the ways models deviate from JSON.
 
-    Models wrap JSON in prose or fences, and sometimes truncate mid-array. This
-    tries a fenced block, then a bracket-balanced scan, then a salvage pass that
-    collects individually-parseable objects.
+    Observed from Falcon3-Mamba: correct findings with exact evidence lines,
+    emitted as `"evidence": 'logger.info(...)'` -- Python string syntax, not
+    JSON. `json.loads` rejects the whole array and every correct finding in it
+    is silently discarded. Being strict here means scoring the model's best work
+    as a total miss, which is the expensive direction to be wrong in.
+
+    `ast.literal_eval` accepts both quote styles natively, so it is the fallback.
+    JSON's bare `true`/`false`/`null` are not Python literals, so those are
+    mapped first -- outside string bodies only.
+    """
+    try:
+        return json.loads(blob)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # trailing commas: {"a": 1,} / [1,]
+    repaired = re.sub(r",(\s*[}\]])", r"\1", blob)
+    for candidate in (repaired, _map_json_literals(repaired)):
+        try:
+            return ast.literal_eval(candidate)
+        except (ValueError, SyntaxError, RecursionError, MemoryError):
+            continue
+    return None
+
+
+def _map_json_literals(blob: str) -> str:
+    """true/false/null -> True/False/None, skipping anything inside a string."""
+    out: list[str] = []
+    i, n = 0, len(blob)
+    quote: str | None = None
+    while i < n:
+        ch = blob[i]
+        if quote:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(blob[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in "\"'":
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        for word, repl in (("true", "True"), ("false", "False"), ("null", "None")):
+            if blob.startswith(word, i) and not (
+                i and (blob[i - 1].isalnum() or blob[i - 1] == "_")
+            ):
+                nxt = i + len(word)
+                if nxt >= n or not (blob[nxt].isalnum() or blob[nxt] == "_"):
+                    out.append(repl)
+                    i = nxt
+                    break
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def _balanced_spans(text: str, open_ch: str, close_ch: str) -> list[str]:
+    """Balanced `open_ch..close_ch` spans, respecting both quote styles.
+
+    Tracking `'` as well as `"` matters: a Python-quoted value containing a
+    double quote -- `'logger.info("x", y)'` -- desynchronises a scanner that
+    only knows about `"`, which then mis-detects where the object ends.
+    """
+    spans: list[str] = []
+    depth = 0
+    start = -1
+    quote: str | None = None
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in "\"'":
+            quote = ch
+        elif ch == open_ch:
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == close_ch and depth:
+            depth -= 1
+            if depth == 0 and start != -1:
+                spans.append(text[start : i + 1])
+                start = -1
+        i += 1
+    return spans
+
+
+def extract_json_array(text: str) -> list[dict]:
+    """Pull findings out of model output, tolerating near-JSON and truncation.
+
+    Four passes, most faithful first:
+      1. the whole fenced block, or the whole text, as one array
+      2. the first balanced [...] span
+      3. individual balanced {...} objects (survives a truncated array --
+         `max_new_tokens` cutting off the final object should not discard the
+         complete ones before it)
+      4. nothing
     """
     fenced = re.search(r"```(?:json)?\s*(.+?)```", text, re.DOTALL)
     candidates = [fenced.group(1)] if fenced else []
+    # an unterminated fence is the common truncation case
+    unterminated = re.search(r"```(?:json)?\s*(.+)$", text, re.DOTALL)
+    if unterminated:
+        candidates.append(unterminated.group(1))
     candidates.append(text)
 
     for cand in candidates:
-        start = cand.find("[")
-        if start == -1:
-            continue
-        depth, in_str, esc = 0, False, False
-        for i in range(start, len(cand)):
-            ch = cand[i]
-            if in_str:
-                if esc:
-                    esc = False
-                elif ch == "\\":
-                    esc = True
-                elif ch == '"':
-                    in_str = False
-                continue
-            if ch == '"':
-                in_str = True
-            elif ch == "[":
-                depth += 1
-            elif ch == "]":
-                depth -= 1
-                if depth == 0:
-                    try:
-                        parsed = json.loads(cand[start : i + 1])
-                        if isinstance(parsed, list):
-                            return [p for p in parsed if isinstance(p, dict)]
-                    except json.JSONDecodeError:
-                        break
-    # salvage: individual objects, e.g. from a truncated generation
+        for span in _balanced_spans(cand, "[", "]")[:1]:
+            parsed = _loads_lenient(span)
+            if isinstance(parsed, list):
+                dicts = [p for p in parsed if isinstance(p, dict)]
+                if dicts:
+                    return dicts
+
+    # Object-by-object salvage. Keeps whatever completed before a cutoff.
     out: list[dict] = []
-    for m in re.finditer(r"\{[^{}]*\}", text, re.DOTALL):
-        try:
-            obj = json.loads(m.group(0))
+    seen: set[str] = set()
+    for cand in candidates:
+        spans = _balanced_spans(cand, "{", "}")
+        for span in spans:
+            obj = _loads_lenient(span)
             if isinstance(obj, dict) and "title" in obj:
-                out.append(obj)
-        except json.JSONDecodeError:
-            continue
+                key = str(obj.get("title"))
+                if key not in seen:
+                    seen.add(key)
+                    out.append(obj)
+        # A generation cut off by max_new_tokens leaves a final object with
+        # several complete fields and no closing brace. Those fields are real
+        # model output; discarding them loses recall for a formatting reason.
+        tail_start = cand.rfind(spans[-1]) + len(spans[-1]) if spans else 0
+        obj = _repair_truncated_object(cand[tail_start:])
+        if obj is not None and str(obj.get("title")) not in seen:
+            seen.add(str(obj.get("title")))
+            out.append(obj)
+        if out:
+            break
     return out
+
+
+def _repair_truncated_object(fragment: str) -> dict | None:
+    """Recover a dict from an object the model never finished.
+
+    Walks back one line at a time, dropping the incomplete tail, until the
+    remainder closes into something parseable with a `title`.
+    """
+    start = fragment.find("{")
+    if start == -1:
+        return None
+    lines = fragment[start:].splitlines()
+    for stop in range(len(lines), 0, -1):
+        chunk = "\n".join(lines[:stop]).rstrip().rstrip(",")
+        if not chunk.endswith("}"):
+            chunk += "}"
+        obj = _loads_lenient(chunk)
+        if isinstance(obj, dict) and "title" in obj:
+            return obj
+    return None
 
 
 # Shapes seen when a model authors an illustrative example instead of quoting.

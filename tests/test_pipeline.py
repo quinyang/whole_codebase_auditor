@@ -368,8 +368,15 @@ def test_extract_json_handles_fences_and_prose():
 
 
 def test_extract_json_salvages_a_truncated_array():
+    """Both objects survive: the complete one, plus the cut-off one repaired.
+
+    Previously only the complete object was kept. A generation stopped by
+    max_new_tokens leaves real fields in the final object; dropping them loses
+    recall for a formatting reason.
+    """
     truncated = '[{"title": "a", "severity": "high"}, {"title": "b", "severity": "low"'
-    assert len(extract_json_array(truncated)) == 1
+    titles = {o["title"] for o in extract_json_array(truncated)}
+    assert titles == {"a", "b"}
 
 
 def test_hallucinated_paths_are_stripped_and_flagged(built):
@@ -543,3 +550,86 @@ def test_fabricated_evidence_gets_a_distinct_note(built):
     f = parse_findings(raw, p)[0]
     assert not f.grounded
     assert any("AUTHORED" in n for n in f.notes)
+
+
+# --------------------------------------------------------------------------- #
+# lenient JSON parsing -- models do not reliably emit strict JSON
+# --------------------------------------------------------------------------- #
+
+FALCON_SINGLE_QUOTED = """```json
+[
+    {
+        "title": "Hardcoded Credential Exposed via Log Message",
+        "severity": "high",
+        "category": "injection",
+        "files": ["lib/db.py", "app/handlers.py"],
+        "evidence": 'logger.info("connecting with %s", DB_PASSWORD)',
+        "why_cross_file": "defined in config, logged in handlers",
+        "confidence": 1.0
+    },
+    {
+        "title": "Untrusted Input Reaches Database Sink",
+        "severity": "high",
+        "category": "injection",
+        "files": ["lib/db.py", "app/handlers.py"],
+        "evidence": 'execute_raw("SELECT * FROM " + table)',
+        "why_cross_file": "user data reaches execute_raw",
+"""
+
+
+def test_python_style_quotes_are_parsed():
+    """Observed from Falcon3-Mamba: correct findings emitted with Python string
+    syntax. Strict json.loads discarded every one of them, scoring the model's
+    best work as a total miss."""
+    objs = extract_json_array(FALCON_SINGLE_QUOTED)
+    assert len(objs) == 2
+    assert objs[0]["evidence"] == 'logger.info("connecting with %s", DB_PASSWORD)'
+    assert objs[1]["evidence"] == 'execute_raw("SELECT * FROM " + table)'
+
+
+def test_truncated_final_object_is_recovered():
+    """max_new_tokens cutting off the last object must not discard it."""
+    objs = extract_json_array(FALCON_SINGLE_QUOTED)
+    assert any("Untrusted Input" in o["title"] for o in objs)
+
+
+def test_json_literals_map_to_python():
+    raw = '[{"title": "a", "ok": true, "bad": false, "x": null, "evidence": \'y\'}]'
+    objs = extract_json_array(raw)
+    assert objs and objs[0]["ok"] is True and objs[0]["x"] is None
+
+
+def test_trailing_commas_tolerated():
+    raw = '[{"title": "a", "severity": "high",}, {"title": "b",},]'
+    assert len(extract_json_array(raw)) == 2
+
+
+def test_apostrophe_inside_double_quoted_value_survives():
+    """The scanner tracks both quote chars; it must not treat ' as an opener
+    when it appears inside a normal JSON string."""
+    raw = '[{"title": "it\'s fine", "evidence": "x = 1"}]'
+    objs = extract_json_array(raw)
+    assert objs and objs[0]["title"] == "it's fine"
+
+
+def test_strict_json_still_preferred():
+    raw = '[{"title": "a", "evidence": "b"}]'
+    assert extract_json_array(raw) == [{"title": "a", "evidence": "b"}]
+
+
+def test_prose_without_json_yields_nothing():
+    assert extract_json_array("I could not find any vulnerabilities.") == []
+
+
+def test_lenient_parsing_grounds_real_evidence(built):
+    _, parsed, g = built
+    p = pack(parsed.files, g, budget_tokens=32_000)
+    raw = (
+        '[{"title": "leak", "severity": "critical", "category": "hardcoded_secret",'
+        ' "files": ["lib/config.py"],'
+        " \"evidence\": 'DB_PASSWORD = \"admin_password_123\"',"
+        ' "why_cross_file": "x", "confidence": 1.0}]'
+    )
+    f = parse_findings(raw, p)[0]
+    assert f.grounded
+    assert f.location == "lib/config.py:3"

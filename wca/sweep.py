@@ -407,7 +407,8 @@ def run_validation(
     print("=" * 70)
     root = materialise_toy_vuln(tempfile.mkdtemp(prefix="wca_toy_"))
     _b, parsed, graph = _prepare(str(root), quiet=True)
-    pos = audit_once(auditor, parsed.files, graph, budget, repo_name="toy_vuln")
+    pos = audit_once(auditor, parsed.files, graph, budget,
+                     repo_name="toy_vuln", max_new_tokens=1024)
     if pos.error:
         print(f"FAILED: {pos.error}")
         return {"error": pos.error}
@@ -420,7 +421,8 @@ def run_validation(
     print(f"NEGATIVE CONTROL -- {negative_control} (expect NO findings)")
     print("=" * 70)
     _b2, parsed2, graph2 = _prepare(negative_control, quiet=True)
-    neg = audit_once(auditor, parsed2.files, graph2, budget, repo_name=negative_control)
+    neg = audit_once(auditor, parsed2.files, graph2, budget,
+                     repo_name=negative_control, max_new_tokens=1024)
     if neg.error:
         print(f"FAILED: {neg.error}")
         neg_n = -1
