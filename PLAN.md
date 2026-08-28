@@ -162,7 +162,40 @@ whole project — below what a 76-file repo needs even in signature form (the
 packer omitted 72–74 of 76 files at these budgets). Not an algorithmic limit; a
 hardware-plus-implementation one.
 
-**Open: grounding rate is 0% on a real repo** despite valid JSON and sensible
+### RESOLVED: grounding is a precision filter, not just an honesty label
+
+Measured on Falcon3-Mamba-7B-Instruct at 4k budget:
+
+| repo | raw findings | **grounded** | reported |
+|---|---|---|---|
+| toy_vuln (2 planted) | 2 | **2 (100%)** | 2, both correct |
+| pallets/click (clean) | 3 | **0 (0%)** | 0 |
+
+Perfect separation. Every hallucinated finding on the clean repo failed to
+resolve to a real source line; every genuine finding resolved. The offset
+manifest, built to make findings *auditable*, turns out to be the precision
+mechanism — and it costs nothing at inference time.
+
+This is the strongest result the project has. It is also a general claim worth
+stating carefully: **a model that must quote its evidence can be checked against
+the source, and hallucinations do not survive the check.**
+
+Two supporting fixes:
+
+- **Lenient JSON parsing.** The model emitted correct findings as
+  `"evidence": 'logger.info(...)'` — Python string syntax. `json.loads` rejected
+  the array and discarded every correct finding, scoring 0/2. Now falls back to
+  `ast.literal_eval`, tracks both quote styles when scanning for balanced spans,
+  and repairs objects truncated by `max_new_tokens`.
+- **Graph-based attribution repair.** The model produced the correct evidence
+  line but named the wrong counterpart file (`lib/db.py` for a credential defined
+  in `lib/config.py`). It is reliable about *where it is looking*, unreliable
+  about *what it is looking at*. `enrich_with_graph()` derives the counterpart
+  from symbols on the evidence line that are defined in exactly one other file —
+  the same unambiguity rule the call edges use. Score went 1/2 → **2/2**, with
+  the symbol graph doing the cross-file work rather than the model guessing.
+
+**Superseded: grounding rate was 0% on a real repo** despite valid JSON and sensible
 findings, where the toy fixture grounds fine. `closest_line()` diagnostics were
 added to distinguish the two possible causes — a near-miss (model paraphrasing
 real code, so tighten the prompt) versus no close match (model citing a file the

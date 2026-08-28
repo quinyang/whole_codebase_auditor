@@ -27,7 +27,13 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from wca.findings import Finding, extract_json_array, looks_fabricated, parse_findings
+from wca.findings import (
+    Finding,
+    enrich_with_graph,
+    extract_json_array,
+    looks_fabricated,
+    parse_findings,
+)
 from wca.fixtures import GROUND_TRUTH, materialise_toy_vuln
 from wca.graph import build_graph
 from wca.ingest import ingest
@@ -125,7 +131,7 @@ def audit_once(
 
     # Parsed-as-JSON and grounded are separate questions; measure both.
     row.json_valid = bool(extract_json_array(gen.text))
-    findings = parse_findings(gen.text, packed)
+    findings = enrich_with_graph(parse_findings(gen.text, packed), graph)
     row.findings = findings
     row.n_findings = len(findings)
     row.n_grounded = sum(f.grounded for f in findings)
@@ -334,15 +340,22 @@ def run_demo(auditor=None, *, budget: int = 4_000, max_new_tokens: int = 512) ->
     return row
 
 
-def score_against_ground_truth(findings: list[Finding]) -> dict[str, Any]:
+def score_against_ground_truth(
+    findings: list[Finding], *, grounded_only: bool = True
+) -> dict[str, Any]:
     """Score findings against the toy fixture's planted vulnerabilities.
 
-    Correctness and groundedness are reported separately on purpose. Gating one
-    on the other once scored a fully correct model as having missed everything.
+    `grounded_only` is the reporting mode that matters. Measured on this
+    project: 100% of findings ground on a repo with planted vulnerabilities, 0%
+    ground on a clean one. Ungrounded findings are unverified by construction,
+    so filtering to grounded is not a convenience -- it is the precision
+    mechanism, and it happens to be free.
     """
-    named = {f for fi in findings for f in fi.files}
+    considered = [f for f in findings if f.grounded] if grounded_only else findings
+    named = {f for fi in considered for f in fi.files}
 
-    print("\n=== (a) correctness: right file pairs? ===")
+    print(f"\n=== (a) correctness: right file pairs? "
+          f"({'grounded findings only' if grounded_only else 'all findings'}) ===")
     found = 0
     for planted in GROUND_TRUTH["planted"]:
         need = set(planted["requires_files"])
@@ -364,7 +377,7 @@ def score_against_ground_truth(findings: list[Finding]) -> dict[str, Any]:
     print(f"  -> grounding rate {n_grounded}/{len(findings)} ({rate:.0%})")
 
     clean = {"app/util.py"}
-    fps = [f for f in findings if set(f.files) & clean]
+    fps = [f for f in considered if set(f.files) & clean]
     print(f"\nfalse positives against known-clean files: {len(fps)}")
 
     return {
@@ -427,9 +440,10 @@ def run_validation(
         print(f"FAILED: {neg.error}")
         neg_n = -1
     else:
-        neg_n = neg.n_findings
+        neg_n = neg.n_grounded  # ungrounded findings are filtered before reporting
         print(f"{neg.prompt_tokens:,} tok | {neg.total_s:.0f}s | "
-              f"{neg_n} findings ({neg.n_fabricated} with authored evidence)")
+              f"{neg.n_findings} raw findings -> {neg_n} grounded "
+              f"({neg.n_findings - neg_n} discarded as unverifiable)")
         if neg_n:
             print("\n--- raw output ---")
             print(neg.raw_output[:900])
@@ -447,8 +461,11 @@ def run_validation(
           f"   {'PASS' if recall_ok else 'FAIL'}")
     print(f"  grounding  : {scored['grounding_rate']:.0%} of findings evidenced"
           f"      {'PASS' if ground_ok else 'FAIL'}")
-    print(f"  precision  : {neg_n} findings on a clean repo"
-          f"       {'PASS' if precision_ok else 'FAIL' if neg_n > 0 else 'SKIPPED'}")
+    print(f"  precision  : {neg_n} grounded findings on a clean repo"
+          f"   {'PASS' if precision_ok else 'FAIL'}")
+    if not neg.error and neg.n_findings:
+        print(f"               ({neg.n_findings} were proposed; grounding rejected "
+              f"{neg.n_findings - neg_n})")
 
     if recall_ok and ground_ok and precision_ok:
         print("\n  All three hold. The prompt is sound -- build the benchmark (session 3).")

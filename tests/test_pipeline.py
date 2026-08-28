@@ -633,3 +633,69 @@ def test_lenient_parsing_grounds_real_evidence(built):
     f = parse_findings(raw, p)[0]
     assert f.grounded
     assert f.location == "lib/config.py:3"
+
+
+# --------------------------------------------------------------------------- #
+# graph-based attribution repair
+# --------------------------------------------------------------------------- #
+
+
+def test_graph_repairs_wrong_file_attribution(built):
+    """Observed: the model produced the correct evidence line but named the
+    wrong counterpart file. It is reliable about where it is looking and
+    unreliable about what it is looking at, so derive the counterpart from the
+    symbol graph instead of trusting it."""
+    from wca.findings import enrich_with_graph
+
+    _, parsed, g = built
+    p = pack(parsed.files, g, budget_tokens=32_000)
+    raw = (
+        '[{"title": "leak", "severity": "critical", "category": "hardcoded_secret",'
+        ' "files": ["lib/db.py"],'  # wrong counterpart
+        " \"evidence\": 'logger.info(\"connecting with %s / %s\", get_conn_string(), DB_PASSWORD)',"
+        ' "why_cross_file": "x", "confidence": 1.0}]'
+    )
+    f = enrich_with_graph(parse_findings(raw, p), g)[0]
+    assert f.grounded
+    # get_conn_string is defined only in lib/config.py -> that is the counterpart
+    assert "lib/config.py" in f.files
+    assert any("symbol graph" in n for n in f.notes)
+
+
+def test_graph_enrichment_ignores_ambiguous_symbols(tmp_path):
+    """A name defined in several files identifies nothing; adding all of them
+    would manufacture cross-file findings out of noise."""
+    from wca.findings import enrich_with_graph
+
+    for i in range(3):
+        (tmp_path / f"m{i}.py").write_text("def shared():\n    return 1\n")
+    (tmp_path / "caller.py").write_text("def go():\n    return shared()\n")
+    parsed = parse_files(from_local(tmp_path).files, LanguageDispatcher())
+    g = build_graph(parsed.files)
+    p = pack(parsed.files, g, budget_tokens=16_000)
+    raw = json.dumps([{
+        "title": "t", "severity": "low", "category": "other",
+        "files": ["caller.py"], "evidence": "return shared()",
+        "why_cross_file": "x", "confidence": 0.5,
+    }])
+    f = enrich_with_graph(parse_findings(raw, p), g)[0]
+    assert not any(p_ in f.files for p_ in ("m0.py", "m1.py", "m2.py"))
+
+
+def test_grounded_only_scoring_discards_hallucinations(built):
+    """The precision mechanism: ungrounded findings never reach the score."""
+    from wca.sweep import score_against_ground_truth
+
+    _, parsed, g = built
+    p = pack(parsed.files, g, budget_tokens=32_000)
+    raw = json.dumps([{
+        "title": "invented", "severity": "high", "category": "injection",
+        "files": ["lib/config.py", "lib/db.py"],
+        "evidence": '["--help", "--show-vars="].append(arg)',  # not in this repo
+        "why_cross_file": "x", "confidence": 0.95,
+    }])
+    findings = parse_findings(raw, p)
+    assert findings and not findings[0].grounded
+    scored = score_against_ground_truth(findings, grounded_only=True)
+    assert scored["identified"] == 0
+    assert scored["false_positives"] == 0

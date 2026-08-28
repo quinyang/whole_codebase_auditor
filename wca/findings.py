@@ -325,6 +325,37 @@ def parse_findings(model_text: str, packed: PackedContext) -> list[Finding]:
     return findings
 
 
+_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+
+
+def enrich_with_graph(findings: list[Finding], graph) -> list[Finding]:
+    """Repair file attribution using the symbol graph rather than trusting the model.
+
+    Observed: for the credential leak the model produced the *correct evidence
+    line* (`logger.info(..., get_conn_string(), DB_PASSWORD)` in
+    app/handlers.py) but named `lib/db.py` as the counterpart file, when the
+    credential is defined in `lib/config.py`. The model is reliable about where
+    it is looking and unreliable about what it is looking at.
+
+    The grounded location is a fact; the counterpart can be derived. Any symbol
+    on the evidence line that is defined in exactly one other file identifies
+    that file -- the same unambiguity rule `graph.py` uses for call edges. This
+    is the symbol graph doing the cross-file work instead of the model guessing.
+    """
+    for f in findings:
+        if not f.grounded or not f.location:
+            continue
+        for name in set(_IDENT.findall(f.evidence)):
+            owners = graph.def_index.get(name, [])
+            if len(owners) != 1:
+                continue  # ambiguous names carry no information
+            owner = owners[0]
+            if owner not in f.files:
+                f.files.append(owner)
+                f.notes.append(f"counterpart {owner} resolved via symbol graph ({name})")
+    return findings
+
+
 @dataclass
 class AuditReport:
     repo: str
