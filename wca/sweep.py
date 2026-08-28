@@ -27,7 +27,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from wca.findings import Finding, extract_json_array, parse_findings
+from wca.findings import Finding, extract_json_array, looks_fabricated, parse_findings
 from wca.fixtures import GROUND_TRUTH, materialise_toy_vuln
 from wca.graph import build_graph
 from wca.ingest import ingest
@@ -47,6 +47,7 @@ class SweepRow:
     n_findings: int = 0
     n_grounded: int = 0
     n_cross_file: int = 0
+    n_fabricated: int = 0
     peak_gib: float = 0.0
     prefill_s: float = 0.0
     total_s: float = 0.0
@@ -129,6 +130,9 @@ def audit_once(
     row.n_findings = len(findings)
     row.n_grounded = sum(f.grounded for f in findings)
     row.n_cross_file = sum(f.grounded and f.is_cross_file for f in findings)
+    row.n_fabricated = sum(
+        not f.grounded and looks_fabricated(f.evidence) for f in findings
+    )
 
     # Why did anything fail to ground? A near-miss and a fabrication both
     # show up as 0%, and they need opposite fixes.
@@ -368,4 +372,98 @@ def score_against_ground_truth(findings: list[Finding]) -> dict[str, Any]:
         "planted": len(GROUND_TRUTH["planted"]),
         "grounding_rate": rate,
         "false_positives": len(fps),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Prompt validation -- the two-sided test
+# --------------------------------------------------------------------------- #
+
+
+def run_validation(
+    auditor=None,
+    *,
+    negative_control: str = "pallets/click",
+    budget: int = 4_000,
+) -> dict[str, Any]:
+    """Check the prompt on a repo that HAS vulnerabilities and one that does not.
+
+    A detector is only meaningful if it does both. Measuring recall alone rewards
+    a model that reports something for every input; measuring precision alone
+    rewards one that reports nothing. `eval/README.md` calls negative controls
+    mandatory for exactly this reason, and this is the smallest version of that.
+
+    Expected after prompt v2:
+      toy_vuln  -> 2/2 identified, evidence grounds, 0 fabricated
+      clean repo -> 0 findings (an empty array is the correct answer)
+    """
+    from wca.infer import MambaAuditor
+
+    if auditor is None:
+        auditor = MambaAuditor()
+
+    print("=" * 70)
+    print("POSITIVE CONTROL -- toy_vuln (2 planted cross-file vulnerabilities)")
+    print("=" * 70)
+    root = materialise_toy_vuln(tempfile.mkdtemp(prefix="wca_toy_"))
+    _b, parsed, graph = _prepare(str(root), quiet=True)
+    pos = audit_once(auditor, parsed.files, graph, budget, repo_name="toy_vuln")
+    if pos.error:
+        print(f"FAILED: {pos.error}")
+        return {"error": pos.error}
+    print(f"{pos.prompt_tokens:,} tok | {pos.total_s:.0f}s | peak {pos.peak_gib:.2f} GiB")
+    print("\n--- raw output ---")
+    print(pos.raw_output[:1200])
+    scored = score_against_ground_truth(pos.findings)
+
+    print("\n" + "=" * 70)
+    print(f"NEGATIVE CONTROL -- {negative_control} (expect NO findings)")
+    print("=" * 70)
+    _b2, parsed2, graph2 = _prepare(negative_control, quiet=True)
+    neg = audit_once(auditor, parsed2.files, graph2, budget, repo_name=negative_control)
+    if neg.error:
+        print(f"FAILED: {neg.error}")
+        neg_n = -1
+    else:
+        neg_n = neg.n_findings
+        print(f"{neg.prompt_tokens:,} tok | {neg.total_s:.0f}s | "
+              f"{neg_n} findings ({neg.n_fabricated} with authored evidence)")
+        if neg_n:
+            print("\n--- raw output ---")
+            print(neg.raw_output[:900])
+            for d in neg.ungrounded[:3]:
+                print(f"  ratio {d['ratio']:.2f}  said: {d['evidence'][:70]!r}")
+
+    print("\n" + "=" * 70)
+    print("VERDICT")
+    print("=" * 70)
+    recall_ok = scored["identified"] == scored["planted"]
+    ground_ok = scored["grounding_rate"] > 0
+    precision_ok = neg_n == 0
+
+    print(f"  recall     : {scored['identified']}/{scored['planted']} planted found"
+          f"   {'PASS' if recall_ok else 'FAIL'}")
+    print(f"  grounding  : {scored['grounding_rate']:.0%} of findings evidenced"
+          f"      {'PASS' if ground_ok else 'FAIL'}")
+    print(f"  precision  : {neg_n} findings on a clean repo"
+          f"       {'PASS' if precision_ok else 'FAIL' if neg_n > 0 else 'SKIPPED'}")
+
+    if recall_ok and ground_ok and precision_ok:
+        print("\n  All three hold. The prompt is sound -- build the benchmark (session 3).")
+    elif not ground_ok and pos.n_fabricated:
+        print("\n  Model still authors evidence rather than quoting it. Shorten the")
+        print("  schema further, or drop `evidence` to a line NUMBER instead of text.")
+    elif not precision_ok and neg_n > 0:
+        print("\n  False positives on a clean repo. This is the number that would sink")
+        print("  a precision claim -- fix before scaling the benchmark.")
+    elif not recall_ok:
+        print("\n  Missed planted vulnerabilities that a 640-token context contains in")
+        print("  full. Prompt or model capability, not context length.")
+
+    return {
+        "positive": pos.to_dict(),
+        "negative": neg.to_dict() if not neg.error else {"error": neg.error},
+        "recall_ok": recall_ok,
+        "grounding_ok": ground_ok,
+        "precision_ok": precision_ok,
     }

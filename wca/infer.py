@@ -28,25 +28,39 @@ DEFAULT_MODEL = "tiiuae/Falcon3-Mamba-7B-Instruct"
 # Falcon3-Mamba-7B-Instruct was trained at 32k. Going beyond is extrapolation.
 MODEL_MAX_CONTEXT = 32_768
 
-SYSTEM_PROMPT = """You are a security code auditor. You are given the source of one repository, \
-concatenated into a single stream. Files marked mode="signature" show only imports and \
-declarations; their bodies are elided.
+# Prompt v2. v1 said "a verbatim code line copied from the stream" and the model
+# still wrote illustrative examples -- inventing a `my_script.sh` with a made-up
+# `export SECRET_TOKEN=...` to demonstrate the *concept* of a leaked credential.
+# Every such finding scored ratio 0.00 against the real stream. The failure was
+# treating `evidence` as "show me what this looks like" rather than "copy this".
+# v2 makes the copy operation mechanical, forbids authoring code explicitly, and
+# says plainly that an empty result is the expected answer for most repos.
+SYSTEM_PROMPT = """You are a security code auditor examining one repository, supplied as a \
+single stream of files. Files marked mode="signature" show only imports and declarations; \
+their bodies are elided and you cannot see them.
 
-Your job is to find CROSS-FILE vulnerabilities: defects that require reading two or more \
-files to see. Examples: a credential defined in one file and transmitted or logged in \
-another; unvalidated input entering at one boundary and reaching a dangerous sink in a \
-different module; an authorization check in one layer that a second code path bypasses.
+Find CROSS-FILE vulnerabilities: defects that require reading two or more files to see. For \
+example a credential defined in one file and logged or transmitted in another; untrusted \
+input entering at one boundary and reaching a dangerous sink in a different module; an \
+authorization check in one layer that a second code path bypasses.
 
-Rules:
-- Report ONLY issues you can point at with a specific file path and a verbatim code line \
-copied from the stream.
-- A finding that involves only one file is out of scope unless it is a hardcoded secret.
-- If you find nothing, return an empty array. Do not invent findings.
-- Output valid JSON and nothing else."""
+THE EVIDENCE FIELD IS A COPY OPERATION, NOT A DESCRIPTION.
+Locate a line inside the stream. Copy it character for character. Paste it into "evidence".
+- Do NOT write example code.
+- Do NOT construct a snippet that illustrates the problem.
+- Do NOT reference a file that does not appear in the stream.
+- Do NOT write comments, prose, or "# In somefile.py:" prefixes.
+If you cannot copy an exact line out of the stream, do not report that finding at all.
+
+Most repositories contain no cross-file vulnerability. Returning [] is the correct and \
+expected answer in that case, and is strongly preferred over a speculative finding. You are \
+not being measured on how many issues you report.
+
+Output valid JSON and nothing else."""
 
 USER_TEMPLATE = """{context}
 
-Audit the repository above.
+Audit the repository above for cross-file vulnerabilities.
 
 Return a JSON array. Each element:
 {{
@@ -55,10 +69,15 @@ Return a JSON array. Each element:
   "category": "hardcoded_secret" | "injection" | "auth_bypass" | "unsafe_deserialization" | \
 "path_traversal" | "data_exposure" | "other",
   "files": ["path/one.py", "path/two.py"],
-  "evidence": "one verbatim line copied exactly from the stream",
-  "why_cross_file": "how the two files combine to create the issue",
+  "evidence": "a single line copied character-for-character from the stream above",
+  "why_cross_file": "how these files combine to create the issue",
   "confidence": 0.0 to 1.0
 }}
+
+Before writing each finding, check: can I find my "evidence" string, exactly as written, \
+somewhere in the stream above? If not, drop the finding.
+
+Return [] if you find no cross-file vulnerability you can evidence this way.
 
 JSON array:"""
 

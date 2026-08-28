@@ -494,3 +494,52 @@ def test_audit_once_records_oom_instead_of_raising():
     assert "out of memory" in row.error
     assert row.n_findings == 0
     assert row.grounding_rate == 0.0
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "# In my_script.sh:\nexport SECRET_TOKEN='supersecrettoken1234567890'\n# then used",
+        "# In core.py:\n# The following function signature shows how flags can be set",
+        "For example, the password would look like this",
+        "// example: pass the token here",
+        "some_call(arg)...",
+    ],
+)
+def test_authored_examples_are_flagged_as_fabricated(evidence):
+    """Observed on pallets/click: the model wrote tutorial snippets, inventing a
+    file and a secret, instead of quoting the stream. Distinguishing this from a
+    near-miss matters -- one is a prompt bug, the other a matcher bug."""
+    from wca.findings import looks_fabricated
+
+    assert looks_fabricated(evidence)
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        'DB_PASSWORD = "admin_password_123"',
+        "cur.execute(sql)",
+        "logger.info('connecting with %s', DB_PASSWORD)",
+        "return execute_raw('SELECT * FROM ' + table)",
+        "",
+    ],
+)
+def test_real_code_lines_are_not_flagged_as_fabricated(evidence):
+    from wca.findings import looks_fabricated
+
+    assert not looks_fabricated(evidence)
+
+
+def test_fabricated_evidence_gets_a_distinct_note(built):
+    _, parsed, g = built
+    p = pack(parsed.files, g, budget_tokens=32_000)
+    raw = json.dumps([{
+        "title": "Leaked token", "severity": "high", "category": "hardcoded_secret",
+        "files": ["lib/config.py"],
+        "evidence": "# In my_script.sh:\nexport SECRET_TOKEN='supersecret1234567890'",
+        "why_cross_file": "n/a", "confidence": 1.0,
+    }])
+    f = parse_findings(raw, p)[0]
+    assert not f.grounded
+    assert any("AUTHORED" in n for n in f.notes)

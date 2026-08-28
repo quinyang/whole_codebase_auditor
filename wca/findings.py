@@ -111,6 +111,33 @@ def extract_json_array(text: str) -> list[dict]:
     return out
 
 
+# Shapes seen when a model authors an illustrative example instead of quoting.
+# Observed on pallets/click: evidence of "# In my_script.sh:\nexport
+# SECRET_TOKEN='supersecret...'" -- a file that does not exist, a secret that was
+# invented. Distinguishing "fabricated" from "quoted but unmatched" matters: the
+# first is a prompt problem, the second is a matcher problem.
+_FABRICATION_HINTS = (
+    re.compile(r"^\s*#\s*(in|example|file)\b", re.IGNORECASE),
+    re.compile(r"^\s*(//|/\*|<!--)"),
+    re.compile(r"\b(for example|e\.g\.|such as|imagine|suppose|would look like)\b", re.IGNORECASE),
+    re.compile(r"\.\.\.$"),
+)
+
+
+def looks_fabricated(evidence: str) -> bool:
+    """Heuristic: does this read as authored illustration rather than a quotation?
+
+    Multi-line evidence with comment scaffolding is the strongest signal -- real
+    code lines are single lines without a "# In file.py:" preamble.
+    """
+    s = evidence.strip()
+    if not s:
+        return False
+    if "\n" in s and any(ln.strip().startswith("#") for ln in s.splitlines()):
+        return True
+    return any(p.search(s) for p in _FABRICATION_HINTS)
+
+
 def _coerce(raw: dict) -> Finding:
     sev = str(raw.get("severity", "medium")).lower().strip()
     cat = str(raw.get("category", "other")).lower().strip()
@@ -157,6 +184,8 @@ def parse_findings(model_text: str, packed: PackedContext) -> list[Finding]:
                 f.grounded = True
                 if path not in f.files:
                     f.files.insert(0, path)
+            elif looks_fabricated(f.evidence):
+                f.notes.append("evidence appears AUTHORED, not quoted (illustrative example)")
             else:
                 f.notes.append("evidence line not found in stream")
         else:
