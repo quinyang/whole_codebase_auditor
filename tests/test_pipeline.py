@@ -699,3 +699,93 @@ def test_grounded_only_scoring_discards_hallucinations(built):
     scored = score_against_ground_truth(findings, grounded_only=True)
     assert scored["identified"] == 0
     assert scored["false_positives"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# benchmark injection (session 3)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def clean_bundle():
+    from wca.fixtures import materialise_toy_vuln
+
+    root = materialise_toy_vuln(tempfile.mkdtemp())
+    bundle = from_local(root)
+    graph = build_graph(parse_files(bundle.files, LanguageDispatcher()).files)
+    return bundle, graph
+
+
+@pytest.mark.parametrize("distance", ["near", "far"])
+def test_injected_lines_are_recorded_exactly(clean_bundle, distance):
+    """A wrong line number silently corrupts every score derived from the corpus
+    and is invisible in the final number. It was off by one on first run."""
+    from wca.inject import inject, verify
+
+    bundle, g = clean_bundle
+    case = inject(bundle, g, seed=42, distance=distance)
+    assert case.planted
+    assert verify(case) == []
+
+
+@pytest.mark.parametrize("distance", ["near", "far"])
+def test_injected_lines_ground_through_the_manifest(clean_bundle, distance):
+    """If a planted line cannot be resolved, recall is unmeasurable for it."""
+    from wca.inject import inject
+
+    bundle, g = clean_bundle
+    case = inject(bundle, g, seed=42, distance=distance)
+    parsed = parse_files(case.files, LanguageDispatcher())
+    g2 = build_graph(parsed.files)
+    p = pack(parsed.files, g2, budget_tokens=16_000, repo_name="injected")
+    for planted in case.planted:
+        for spot in planted.spots.values():
+            assert p.resolve_snippet(spot.code) == (spot.file, spot.line)
+
+
+def test_injection_creates_real_cross_file_edges(clean_bundle):
+    """The planted halves must actually be linked, or the case tests nothing
+    about cross-file reasoning."""
+    from wca.inject import inject
+
+    bundle, g = clean_bundle
+    case = inject(bundle, g, seed=42)
+    g2 = build_graph(parse_files(case.files, LanguageDispatcher()).files)
+    edges = {(e.src, e.dst) for e in g2.edges}
+    for planted in case.planted:
+        a, b = planted.requires_files
+        assert (a, b) in edges or (b, a) in edges
+
+
+def test_negative_control_is_untouched(clean_bundle):
+    """Precision is unmeasurable without repos that contain nothing."""
+    from wca.inject import inject
+
+    bundle, g = clean_bundle
+    case = inject(bundle, g, seed=1, patterns=())
+    assert case.is_negative_control
+    assert not case.planted
+    assert case.clean_files == {f.path for f in bundle.files}
+    assert [f.text for f in case.files] == [f.text for f in bundle.files]
+
+
+def test_injection_is_reproducible_from_seed(clean_bundle):
+    """A score nobody can re-derive is not a result."""
+    from wca.inject import inject
+
+    bundle, g = clean_bundle
+    a = inject(bundle, g, seed=7)
+    b = inject(bundle, g, seed=7)
+    c = inject(bundle, g, seed=8)
+    assert a.ground_truth() == b.ground_truth()
+    assert [f.text for f in a.files] == [f.text for f in b.files]
+    assert a.ground_truth() != c.ground_truth()
+
+
+def test_verify_catches_a_corrupted_ground_truth(clean_bundle):
+    from wca.inject import inject, verify
+
+    bundle, g = clean_bundle
+    case = inject(bundle, g, seed=42)
+    case.planted[0].spots["definition"].line += 3
+    assert verify(case)
