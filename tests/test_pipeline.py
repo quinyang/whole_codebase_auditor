@@ -789,3 +789,118 @@ def test_verify_catches_a_corrupted_ground_truth(clean_bundle):
     case = inject(bundle, g, seed=42)
     case.planted[0].spots["definition"].line += 3
     assert verify(case)
+
+
+# --------------------------------------------------------------------------- #
+# benchmark scoring
+# --------------------------------------------------------------------------- #
+
+
+def _audit_fake(case, model_json):
+    from wca.findings import enrich_with_graph
+
+    parsed = parse_files(case.files, LanguageDispatcher())
+    g = build_graph(parsed.files)
+    p = pack(parsed.files, g, budget_tokens=16_000, repo_name="x")
+    return enrich_with_graph(parse_findings(model_json, p), g)
+
+
+def _quote(spot, i=0):
+    return json.dumps({
+        "title": f"f{i}", "severity": "high", "category": "injection",
+        "files": [spot.file], "evidence": spot.code,
+        "why_cross_file": "x", "confidence": 0.9,
+    })
+
+
+def test_scoring_credits_planted_vulnerabilities(clean_bundle):
+    from wca.benchmark import score_case
+    from wca.inject import inject
+
+    bundle, g = clean_bundle
+    case = inject(bundle, g, seed=42, distance="near")
+    spots = [s for p in case.planted for s in p.spots.values()]
+    raw = "[" + ",".join(_quote(s, i) for i, s in enumerate(spots)) + "]"
+    o = score_case(_audit_fake(case, raw), case, "near", "toy")
+    assert o.true_positives == len(case.planted)
+    assert o.false_positives == 0
+    assert not o.planted_missed
+
+
+def test_ungrounded_hallucination_is_not_a_false_positive(clean_bundle):
+    """The negative-control result depends on this: a finding the model could
+    not evidence is filtered before scoring, so it costs nothing."""
+    from wca.benchmark import score_case
+    from wca.inject import inject
+
+    bundle, g = clean_bundle
+    clean = inject(bundle, g, seed=42, patterns=())
+    raw = json.dumps([{
+        "title": "ghost", "severity": "high", "category": "injection",
+        "files": ["lib/db.py"], "evidence": "os.system(user_input)",
+        "why_cross_file": "x", "confidence": 0.95,
+    }])
+    o = score_case(_audit_fake(clean, raw), clean, "clean", "toy")
+    assert o.n_grounded == 0
+    assert o.false_positives == 0
+
+
+def test_grounded_but_unplanted_finding_is_a_false_positive(clean_bundle):
+    """Quoting real code is not the same as being right. A grounded finding on a
+    clean repo matches nothing planted and must be counted against precision."""
+    from wca.benchmark import score_case
+    from wca.inject import inject
+
+    bundle, g = clean_bundle
+    clean = inject(bundle, g, seed=42, patterns=())
+    raw = json.dumps([{
+        "title": "real line, nothing planted", "severity": "high", "category": "injection",
+        "files": ["lib/db.py"], "evidence": "cur.execute(sql)",
+        "why_cross_file": "x", "confidence": 0.9,
+    }])
+    o = score_case(_audit_fake(clean, raw), clean, "clean", "toy")
+    assert o.n_grounded == 1
+    assert o.false_positives == 1
+    assert o.true_positives == 0
+
+
+def test_missed_planted_vulnerabilities_are_recorded(clean_bundle):
+    from wca.benchmark import score_case
+    from wca.inject import inject
+
+    bundle, g = clean_bundle
+    case = inject(bundle, g, seed=42, distance="near")
+    spot = next(iter(case.planted[0].spots.values()))
+    o = score_case(_audit_fake(case, "[" + _quote(spot) + "]"), case, "near", "toy")
+    assert o.true_positives == 1
+    assert len(o.planted_missed) == len(case.planted) - 1
+
+
+def test_summary_computes_precision_recall_and_ablation():
+    from wca.benchmark import AuditOutcome, summarise
+
+    outcomes = [
+        AuditOutcome(repo="a", variant="near", n_planted=2, true_positives=2),
+        AuditOutcome(repo="a", variant="far", n_planted=2, true_positives=1),
+        AuditOutcome(repo="a", variant="clean", n_planted=0, false_positives=1),
+    ]
+    s = summarise(outcomes)
+    assert s["true_positives"] == 3
+    assert s["false_positives"] == 1
+    assert s["recall"] == 0.75  # 3 of 4 planted
+    assert s["precision"] == 0.75  # 3 of 4 reported
+    assert s["by_variant"]["near"]["recall"] == 1.0
+    assert s["by_variant"]["far"]["recall"] == 0.5
+
+
+def test_failed_audits_do_not_corrupt_the_score():
+    from wca.benchmark import AuditOutcome, summarise
+
+    outcomes = [
+        AuditOutcome(repo="a", variant="near", n_planted=2, true_positives=2),
+        AuditOutcome(repo="b", variant="near", n_planted=2, error="OOM"),
+    ]
+    s = summarise(outcomes)
+    assert s["failed_audits"] == 1
+    assert s["planted_total"] == 2  # the failed repo's planted vulns are excluded
+    assert s["recall"] == 1.0
