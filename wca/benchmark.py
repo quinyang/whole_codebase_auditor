@@ -26,8 +26,9 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from wca.corpus import SYNTHETIC_CORPUS, generate_corpus
 from wca.graph import build_graph
-from wca.ingest import ingest
+from wca.ingest import RepoBundle, ingest
 from wca.inject import BenchmarkCase, inject, verify
 from wca.pack import pack
 from wca.parse import LanguageDispatcher, parse_files
@@ -48,6 +49,12 @@ DEFAULT_CORPUS: tuple[str, ...] = (
     "seatgeek/thefuzz",
 )
 
+# Must mirror pack.pack()'s defaults: it reserves this many tokens for the
+# preamble and the model's output, then spends at most FULL_BODY_SHARE of the
+# remainder on full bodies. A slice sized to the raw budget overshoots badly.
+RESERVE_TOKENS = 2_000
+FULL_BODY_SHARE = 0.70
+
 # Line tolerance when matching a finding to a planted spot. The model quotes a
 # line; a couple of lines of drift is still the same defect.
 LINE_TOLERANCE = 3
@@ -64,6 +71,8 @@ class RepoCases:
     far: BenchmarkCase | None = None
     clean: BenchmarkCase | None = None
     error: str = ""
+    whole_repo_coverage: float = 0.0  # planted vulns the packer keeps at full scale
+    sliced: bool = False
 
     def variants(self) -> list[tuple[str, BenchmarkCase]]:
         return [
@@ -97,17 +106,32 @@ class AuditOutcome:
 # --------------------------------------------------------------------------- #
 
 
-def prepare_repo(spec: str, *, seed: int, max_files: int = 60) -> RepoCases:
-    """Download one repo and build its three variants. Never raises."""
-    last: Exception | None = None
-    for ref in ("main", "master"):
-        try:
-            bundle = ingest(spec, ref)
-            break
-        except Exception as exc:  # network, 404, wrong default branch
-            last = exc
+def prepare_repo(
+    spec: str,
+    *,
+    seed: int,
+    max_files: int = 80,
+    budget: int = 4_000,
+    bundle: RepoBundle | None = None,
+) -> RepoCases:
+    """Build one repo's three variants. Never raises.
+
+    Pass `bundle` to use an already-constructed repo (the synthetic corpus);
+    otherwise `spec` is downloaded from GitHub.
+    """
+    ref = "synthetic"
+    if bundle is None:
+        last: Exception | None = None
+        for ref in ("main", "master"):
+            try:
+                bundle = ingest(spec, ref)
+                break
+            except Exception as exc:  # network, 404, wrong default branch
+                last = exc
+        else:
+            return RepoCases(repo=spec, ref="?", n_files=0, error=f"ingest failed: {last}")
     else:
-        return RepoCases(repo=spec, ref="?", n_files=0, error=f"ingest failed: {last}")
+        ref = bundle.ref
 
     parsed = parse_files(bundle.files, LanguageDispatcher())
     py = [f for f in parsed.files if f.lang == "python"]
@@ -127,35 +151,189 @@ def prepare_repo(spec: str, *, seed: int, max_files: int = 60) -> RepoCases:
         if problems:
             cases.error = f"{name}: {problems[0]}"
             return cases
-        if not _planted_lines_ground(case):
-            cases.error = f"{name}: a planted line does not resolve through the manifest"
+
+    # How much would the packer surface at WHOLE-REPO scale? Recorded before
+    # slicing, because it is a real property of the packer under the T4 ceiling
+    # and it disappears once we slice.
+    planted_cases = [c for _, c in cases.variants() if c.planted]
+    if planted_cases:
+        cases.whole_repo_coverage = sum(
+            packer_coverage(c, budget) for c in planted_cases
+        ) / len(planted_cases)
+
+    # Slice so both halves of every planted vulnerability reach the model.
+    # Otherwise a 20k-token repo on a 4k budget scores every case a miss for
+    # reasons of memory, not detection.
+    cases.near = slice_to_budget(cases.near, budget)
+    cases.far = slice_to_budget(cases.far, budget)
+    cases.sliced = True
+
+    for name, case in cases.variants():
+        if case.planted and not _planted_lines_ground(case, budget):
+            need = required_tokens(case)
+            capacity = int((budget - RESERVE_TOKENS) * FULL_BODY_SHARE)
+            cases.error = (
+                f"{name}: required files are {need:,} tok; budget {budget:,} gives the "
+                f"packer ~{capacity:,} tok of full bodies. Files too large for this GPU."
+            )
             return cases
     return cases
 
 
-def _planted_lines_ground(case: BenchmarkCase, budget: int = 8_000) -> bool:
+def required_tokens(case: BenchmarkCase) -> int:
+    """Estimated tokens of the files a planted vulnerability spans.
+
+    If this exceeds the budget the case is unauditable on this GPU no matter how
+    good the packer is -- the two halves physically cannot both be in context.
+    """
+    from wca.pack import CHARS_PER_TOKEN
+
+    by_path = {f.path: f for f in case.files}
+    required = {p for planted in case.planted for p in planted.requires_files}
+    return int(sum(len(by_path[p].text) for p in required if p in by_path) / CHARS_PER_TOKEN)
+
+
+def packer_coverage(case: BenchmarkCase, budget: int) -> float:
+    """Fraction of planted vulnerabilities whose BOTH halves survive packing.
+
+    Reported separately from detection, because they are separate abilities and
+    conflating them produces a number that means nothing. Measured on a T4 with
+    a ~5,300-token ceiling, whole-repo coverage of a realistic 20k-token repo is
+    poor -- and that is a fact about the hardware, not about the model.
+    """
     if not case.planted:
-        return True
+        return 1.0
     parsed = parse_files(case.files, LanguageDispatcher())
     graph = build_graph(parsed.files)
     packed = pack(parsed.files, graph, budget_tokens=budget, repo_name=case.repo)
-    return all(
-        packed.resolve_snippet(spot.code) == (spot.file, spot.line)
+    covered = sum(
+        all(
+            packed.resolve_snippet(spot.code) == (spot.file, spot.line)
+            for spot in planted.spots.values()
+        )
         for planted in case.planted
-        for spot in planted.spots.values()
     )
+    return covered / len(case.planted)
+
+
+def slice_to_budget(case: BenchmarkCase, budget: int, *, fill: float = 0.9) -> BenchmarkCase:
+    """Keep the planted files plus their highest-priority neighbours; drop the rest.
+
+    Without this, a realistic 20k-token repo cannot be audited on a T4 at all:
+    at budget 4000 the packer has ~1,400 tokens for full bodies, and a single
+    6 KB source file does not fit. Every planted vulnerability would be scored a
+    miss for a reason that has nothing to do with detection.
+
+    Slicing makes the benchmark measure one thing cleanly -- **can the model see
+    a cross-file defect when both halves are in context** -- and leaves the
+    separate question of whether the packer would have surfaced those files at
+    whole-repo scale to `packer_coverage()`. Two honest numbers beat one
+    ambiguous one.
+    """
+    from wca.pack import CHARS_PER_TOKEN, compute_priority
+
+    if not case.planted:
+        return case
+
+    by_path = {f.path: f for f in case.files}
+    required = {p for planted in case.planted for p in planted.requires_files}
+
+    parsed = parse_files(case.files, LanguageDispatcher())
+    graph = build_graph(parsed.files)
+    priority = compute_priority(graph)
+
+    def cost(path: str) -> int:
+        return int(len(by_path[path].text) / CHARS_PER_TOKEN)
+
+    keep = set(required)
+    spent = sum(cost(p) for p in keep)
+
+    # Size the slice to the packer's FULL-BODY capacity, not to the raw budget.
+    # `pack()` holds back `reserve_tokens` for the preamble and the model's own
+    # output, then spends at most `full_body_share` of what remains on full
+    # bodies -- at budget 4,000 that is ~1,400 tokens, not 4,000. Slicing to a
+    # fraction of the raw budget left the required files just over the line, so
+    # the packer demoted one to signature mode and elided the very body line the
+    # vulnerability lives on. The symptom was a file present in the stream whose
+    # planted line could not be found.
+    full_capacity = int((budget - RESERVE_TOKENS) * FULL_BODY_SHARE)
+    ceiling = max(int(full_capacity * fill), spent)
+
+    others = sorted(
+        (p for p in by_path if p not in keep),
+        key=lambda p: (-priority.get(p, 0.0), cost(p)),
+    )
+    for path in others:
+        c = cost(path)
+        if spent + c > ceiling:
+            continue
+        keep.add(path)
+        spent += c
+
+    sliced = BenchmarkCase(
+        repo=case.repo,
+        seed=case.seed,
+        files=[by_path[p] for p in sorted(keep)],
+        planted=case.planted,
+        clean_files=case.clean_files & keep,
+    )
+    return sliced
+
+
+def _planted_lines_ground(case: BenchmarkCase, budget: int) -> bool:
+    return packer_coverage(case, budget) == 1.0
+
+
+def prepare_synthetic_corpus(
+    names: tuple[str, ...] = SYNTHETIC_CORPUS,
+    *,
+    seed: int = 20260829,
+    budget: int = 4_000,
+) -> list[RepoCases]:
+    """The corpus that actually fits a T4. See `wca/corpus.py` for why.
+
+    No network, so this is fast and reproducible from the seed alone.
+    """
+    out: list[RepoCases] = []
+    for i, bundle in enumerate(generate_corpus(names, seed=seed)):
+        cases = prepare_repo(
+            bundle.name, seed=seed + i * 10, budget=budget, bundle=bundle
+        )
+        status = "OK" if not cases.error else "SKIP"
+        cov = f"{cases.whole_repo_coverage:.0%}" if not cases.error else "-"
+        print(f"  {status:4} {bundle.name:24} {cases.n_files:>3} py | coverage {cov:>4}")
+        if cases.error:
+            print(f"       {cases.error[:96]}")
+        out.append(cases)
+
+    usable = [c for c in out if not c.error]
+    n_planted = sum(len(c.planted) for r in usable for _, c in r.variants())
+    print(
+        f"\n{len(usable)}/{len(names)} repos usable | {len(usable) * 3} audits | "
+        f"{n_planted} planted vulnerabilities"
+    )
+    if usable:
+        mean = sum(c.whole_repo_coverage for c in usable) / len(usable)
+        print(f"Whole-repo packer coverage {mean:.0%} at budget {budget:,} (no slicing needed).")
+    return out
 
 
 def prepare_corpus(
-    specs: tuple[str, ...] = DEFAULT_CORPUS, *, seed: int = 1234, max_files: int = 60
+    specs: tuple[str, ...] = DEFAULT_CORPUS,
+    *,
+    seed: int = 1234,
+    max_files: int = 80,
+    budget: int = 4_000,
 ) -> list[RepoCases]:
     """CPU-only preflight. Run this before booking GPU time."""
     out: list[RepoCases] = []
     for i, spec in enumerate(specs):
-        cases = prepare_repo(spec, seed=seed + i * 10, max_files=max_files)
-        status = "OK" if not cases.error else f"SKIP ({cases.error[:52]})"
-        planted = sum(len(c.planted) for _, c in cases.variants())
-        print(f"  {status:60} {spec} ({cases.n_files} py files, {planted} planted)")
+        cases = prepare_repo(spec, seed=seed + i * 10, max_files=max_files, budget=budget)
+        status = "OK" if not cases.error else "SKIP"
+        cov = f"{cases.whole_repo_coverage:.0%}" if not cases.error else "-"
+        print(f"  {status:4} {spec:32} {cases.n_files:>3} py | coverage {cov:>4}")
+        if cases.error:
+            print(f"       {cases.error[:96]}")
         out.append(cases)
 
     usable = [c for c in out if not c.error]
@@ -166,6 +344,14 @@ def prepare_corpus(
     )
     if len(usable) < len(specs):
         print("Skipped repos are excluded from the score, not counted as misses.")
+    if usable:
+        mean_cov = sum(c.whole_repo_coverage for c in usable) / len(usable)
+        print(
+            f"\nWhole-repo packer coverage: {mean_cov:.0%} of planted vulnerabilities "
+            f"would have both halves\nin context at budget {budget:,} without slicing. "
+            f"Report this alongside detection --\nit is the T4 memory ceiling, measured, "
+            f"not a model failure."
+        )
     return out
 
 

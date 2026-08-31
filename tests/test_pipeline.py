@@ -904,3 +904,53 @@ def test_failed_audits_do_not_corrupt_the_score():
     assert s["failed_audits"] == 1
     assert s["planted_total"] == 2  # the failed repo's planted vulns are excluded
     assert s["recall"] == 1.0
+
+
+# --------------------------------------------------------------------------- #
+# synthetic corpus
+# --------------------------------------------------------------------------- #
+
+
+def test_generated_repos_are_varied():
+    """Ten copies of one repo would make the benchmark measure one repo."""
+    from wca.corpus import generate_corpus
+
+    repos = generate_corpus()
+    assert len(repos) == 10
+    layouts = {tuple(sorted({f.path.split("/")[0] for f in r.files})) for r in repos}
+    assert len(layouts) > 1, "all repos share a layout"
+    sizes = {len(r.files) for r in repos}
+    assert len(sizes) > 1, "all repos are the same size"
+
+
+def test_generated_repos_have_cross_file_edges():
+    """Injection plants onto real import edges; without them the corpus is flat."""
+    from wca.corpus import generate_corpus
+
+    for bundle in generate_corpus():
+        g = build_graph(parse_files(bundle.files, LanguageDispatcher()).files)
+        assert any(e.kind == "import" for e in g.edges), bundle.name
+
+
+def test_generated_repos_are_reproducible():
+    from wca.corpus import generate_repo
+
+    a = generate_repo("x/y", seed=99)
+    b = generate_repo("x/y", seed=99)
+    c = generate_repo("x/y", seed=100)
+    assert [f.text for f in a.files] == [f.text for f in b.files]
+    assert [f.text for f in a.files] != [f.text for f in c.files]
+
+
+def test_synthetic_corpus_fits_the_t4_budget():
+    """The whole point of generating rather than downloading: every planted
+    vulnerability must have both halves reachable at budget 4,000."""
+    from wca.benchmark import _planted_lines_ground, prepare_repo
+    from wca.corpus import generate_corpus
+
+    for i, bundle in enumerate(generate_corpus()):
+        cases = prepare_repo(bundle.name, seed=1234 + i * 10, budget=4_000, bundle=bundle)
+        assert not cases.error, f"{bundle.name}: {cases.error}"
+        for _name, case in cases.variants():
+            if case.planted:
+                assert _planted_lines_ground(case, 4_000)
