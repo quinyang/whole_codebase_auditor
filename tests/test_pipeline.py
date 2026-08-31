@@ -954,3 +954,15 @@ def test_synthetic_corpus_fits_the_t4_budget():
         for _name, case in cases.variants():
             if case.planted:
                 assert _planted_lines_ground(case, 4_000)
+
+
+def test_version_comparison_is_numeric_not_lexicographic():
+    """`"0.10.0" >= "0.9.0"` is False as strings -- a notebook guard written that
+    way rejected the exact build it was meant to require."""
+    from wca import version_tuple
+
+    assert version_tuple("0.10.0") > version_tuple("0.9.0")
+    assert version_tuple("0.10.0") > version_tuple("0.9.9")
+    assert version_tuple("1.0.0") > version_tuple("0.99.0")
+    assert version_tuple("0.10.1") > version_tuple("0.10.0")
+    assert not version_tuple("0.9.0") > version_tuple("0.10.0")
