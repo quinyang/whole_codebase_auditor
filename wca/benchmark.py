@@ -327,18 +327,31 @@ def run_benchmark(
     a 45-minute run you have to do again.
     """
     from wca.findings import enrich_with_graph, parse_findings
-    from wca.infer import MambaAuditor
+    from wca.infer import load_auditor
+
+    todo = [(r, name, case) for r in corpus if not r.error for name, case in r.variants()]
+    if not todo:
+        # Emitting "precision 0.0%" for an empty corpus produces a number that
+        # looks like a result and is not one. Refuse instead.
+        skipped = [r for r in corpus if r.error]
+        msg = [
+            f"Nothing to audit: {len(corpus)} repos in, {len(skipped)} skipped, 0 usable.",
+            "Run prepare_corpus() first (cell 2) and check its output.",
+        ]
+        for r in skipped[:10]:
+            msg.append(f"  SKIP {r.repo}: {r.error[:70]}")
+        raise ValueError("\n".join(msg))
 
     if auditor is None:
-        auditor = MambaAuditor()
+        auditor = load_auditor()
 
     ckpt = Path(checkpoint_dir) if checkpoint_dir else None
     if ckpt:
         ckpt.mkdir(parents=True, exist_ok=True)
 
     outcomes: list[AuditOutcome] = []
-    todo = [(r, name, case) for r in corpus if not r.error for name, case in r.variants()]
-    print(f"{len(todo)} audits queued\n")
+    usable = len({r.repo for r, _, _ in todo})
+    print(f"{len(todo)} audits queued across {usable} repos\n")
 
     for i, (repo_cases, variant, case) in enumerate(todo, 1):
         label = f"[{i}/{len(todo)}] {repo_cases.repo} :: {variant}"

@@ -132,6 +132,53 @@ def free_gpu() -> None:
         pass
 
 
+_ACTIVE: MambaAuditor | None = None
+
+
+def load_auditor(model_id: str | None = None, *, force_reload: bool = False, **kwargs):
+    """Load the model once per process and reuse it. Use this, not `MambaAuditor()`.
+
+    `auditor = MambaAuditor()` cannot free a previously loaded model: Python
+    evaluates the right-hand side *before* rebinding, so the old object is still
+    referenced by the very name being assigned while `__init__` runs. Re-running
+    a load cell therefore puts two 7B models on the GPU -- observed as
+    `weights 4.15 GiB | allocated 8.50 GiB`, which then OOMs at generate time
+    with a confusingly small allocation request.
+
+    Caching the instance at module level removes the failure mode entirely: the
+    second call returns the first model instead of loading another, and is
+    instant rather than a 60-second reload.
+    """
+    global _ACTIVE
+    wanted = model_id or DEFAULT_MODEL
+
+    if (
+        _ACTIVE is not None
+        and not force_reload
+        and _ACTIVE.model_id == wanted
+        and getattr(_ACTIVE, "model", None) is not None
+    ):
+        print(f"[wca] reusing loaded {wanted} (pass force_reload=True to reload)")
+        return _ACTIVE
+
+    if _ACTIVE is not None:
+        _ACTIVE.free()
+        _ACTIVE = None
+        free_gpu()
+
+    _ACTIVE = MambaAuditor(wanted, **kwargs)
+    return _ACTIVE
+
+
+def unload_auditor() -> None:
+    """Drop the cached model and reclaim its VRAM."""
+    global _ACTIVE
+    if _ACTIVE is not None:
+        _ACTIVE.free()
+        _ACTIVE = None
+    free_gpu()
+
+
 def fast_path_available() -> bool:
     """True if a fused selective-scan kernel is importable.
 

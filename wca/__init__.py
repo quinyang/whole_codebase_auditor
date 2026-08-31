@@ -6,7 +6,7 @@ Each stage is importable and independently testable. Only `infer` requires a GPU
 or the `gpu` extra; everything up to and including `pack` runs on CPU.
 """
 
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 
 from wca.graph import SymbolGraph, build_graph
 from wca.ingest import SourceFile, ingest
