@@ -1,62 +1,66 @@
-# Resume bullets — audit and rewrite
+# Resume bullets — final (numbers are real)
 
-## Use this now
+## Use this
 
-**Whole-Codebase Auditor — Mamba/SSM** *(Python, PyTorch, Tree-sitter, CUDA)* | In progress
+**Whole-Codebase Auditor — Mamba/SSM** *(Python, PyTorch, Tree-sitter, CUDA)*
 
-- **Pipeline:** Built a 6-stage repository auditor (tarball ingest → Tree-sitter parse → symbol graph → context packer → SSM inference → findings) as an installable CLI/Colab package; 31 tests, sub-second CPU path on 400-file repos.
-- **Context Packing:** Designed a token-budget packer that orders files by a cross-file symbol graph (imports, call sites, literals; 7 languages) and emits an offset→`file:line` manifest grounding every model claim to real source, validated over 40K offsets.
-- **GPU Profiling:** Found HuggingFace's non-fused Mamba path materializes a `[batch, d_inner, seq_len, d_state]` tensor — activation memory linear in context (~1.5 MiB/token), not the O(1) state the SSM implies; modeled the OOM threshold within 2% and added budget guards.
+- **Pipeline:** Built a 6-stage repository auditor (tarball ingest → Tree-sitter parse → cross-file symbol graph → context packer → SSM inference → grounded findings) as an installable CLI/Colab package; 87 tests, sub-second CPU path on 400-file repos.
+- **Evaluation:** Built a seeded cross-file vulnerability benchmark (10 repositories, 40 injected defects, negative controls) because public benchmarks are single-file; measured **43.8% precision / 17.5% recall** on grounded findings, and reported a **null result** on the graph-ordering ablation rather than a favorable one.
+- **GPU profiling:** Found HuggingFace's non-fused Mamba path materializes a `[batch, d_inner, seq_len, d_state]` tensor — activation memory linear in context (~1.74 MiB/token measured vs 1.5 predicted), not the O(1) state the SSM implies; derived `peak = 4.3 GiB + 1.74 MiB/token`, a ~5,300-token ceiling on a T4, and added budget guards.
 
 ---
 
-## What was wrong with the original
+## Why these are the right three
 
-| Claim | Problem |
+The second and third bullets are what distinguish this from a typical model-usage
+project. Bullet 2 says you built the measurement apparatus and **reported a
+negative result** — interviewers read that as someone who won't oversell. Bullet
+3 says you profiled an implementation against its paper's complexity claim and
+predicted the failure quantitatively.
+
+The recall number is low and that is fine to state plainly. A candidate who
+reports 17.5% with a clear methodology is more credible than one reporting 90%
+with a benchmark nobody can inspect.
+
+---
+
+## Answers you need ready
+
+**"17.5% recall is low. Why present it?"**
+Because it is measured, and the apparatus is the contribution. The benchmark is
+seeded and reproducible, has negative controls, and separates detection from
+retrieval. A number I can defend beats a number I can't.
+
+**"Why a synthetic corpus?"**
+I tried real libraries first and measured why they don't work: a 350-line module
+is ~5,600 tokens and the T4 ceiling is ~5,300, so both halves of a cross-file
+defect physically cannot be in context. The synthetic corpus is a consequence of
+that measurement. On better hardware the same harness runs on real repositories.
+
+**"Your ablation found nothing. Doesn't that undercut the packer?"**
+At 4k context on 10-module repositories, yes — I found no effect and I report it.
+The argument for ordering (an SSM's fixed-size state should lose distant detail)
+predicts an effect at long context on large repositories, which is the regime a
+16 GB GPU can't reach. Untested, not disproven, and I'd say so either way.
+
+**"What does grounding actually buy you?"**
+Auditability, not accuracy. Every reported finding points at a real file and line
+a reviewer can check in seconds. I initially claimed it filtered hallucinations —
+on two repositories it looked like a perfect filter — but at n=30 the grounding
+rate was 17.9% on planted repos and 20.6% on clean ones. Indistinguishable. I
+corrected the claim.
+
+*(That last answer is the strongest thing in this document. It shows you
+measured your own claim, found it wrong, and said so.)*
+
+---
+
+## Do not write
+
+| Don't | Why |
 |---|---|
-| "**enabling detection** of cross-file vulnerabilities" | **Fix this first.** No successful inference run yet — an interviewer reads "detection" and asks for your rate |
-| "6 languages (Python, C/C++, JavaScript, Go)" | Lists 5, says 6, code supports **7** (adds Java, Rust) |
-| "Mamba-2.8B" | Now Falcon3-Mamba-7B-**Instruct**. The 2.8B was a base LM that couldn't follow instructions |
-| "structured context streams" | Was *false* when written — old code discarded the AST. True now |
-| "Mega Memory GitHub Auditor" | Repo is `whole_codebase_auditor`; names should match if you link it |
-| "achieve O(L) scaling" | True for compute, but you've since *measured* something sharper |
-
-The GPU-profiling bullet is the differentiator. Most new-grad resumes say they
-*used* a model; yours says you profiled one, found where the reference
-implementation diverges from the paper's complexity claim, and predicted the
-failure quantitatively.
-
----
-
-## After week 4, swap bullet 3 (keep it if you have room)
-
-- **Evaluation:** Built a cross-file vulnerability benchmark (**[N]** repos, scripted injection with ground truth, negative controls) since public benchmarks are single-file; **[X]%** precision / **[Y]%** recall counting only findings grounded to a verified location, hallucination rate reported separately.
-
----
-
-## Phrasing
-
-| Don't | Do |
-|---|---|
-| "achieves O(1) state memory" | "linear-time inference; the fused kernel is what recovers constant-state memory" |
-| "enabling detection of…" | "grounds findings to…" — describe the mechanism until you have a rate |
-| "6 languages" | "7 languages" |
-| "Mamba-2.8B" | "instruction-tuned 7B Mamba" |
-
----
-
-## Three questions to expect
-
-1. **"Why an SSM over a long-context Transformer?"** — O(L) vs O(L²). Then the
-   honest counterpoint: an SSM has no random access to history, only a
-   fixed-size state, which is *why* the packer orders related files adjacently.
-   Layout is the mitigation for the architecture's weakness.
-2. **"You say linear scaling — what did you measure?"** — Compute is linear, but
-   the HF eager path's *activation memory* is also linear (~1.5 MiB/token)
-   because it materializes the recurrence across all timesteps instead of
-   scanning in SRAM. Predicted the OOM point within 2%.
-3. **"How do you know the findings are real?"** — Every finding must quote an
-   evidence line that resolves through the manifest to a real `file:line`; those
-   that don't are flagged ungrounded and excluded. Limitation: call edges only
-   fire when a symbol is defined in exactly one file, so dynamic dispatch is out
-   of reach by construction.
+| "grounding eliminates false positives" | Measured false: 20.6% grounding on clean repos, all 7 false positives |
+| "graph ordering improves recall" | Measured: −5.0%, a null result |
+| "evaluated on real repositories" | None were audited |
+| "achieves O(1) state memory" | Measured the opposite on the eager path |
+| any recall figure above ~18% | 7 of 40 planted, on grounded findings |

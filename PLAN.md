@@ -162,7 +162,14 @@ whole project — below what a 76-file repo needs even in signature form (the
 packer omitted 72–74 of 76 files at these budgets). Not an algorithmic limit; a
 hardware-plus-implementation one.
 
-### RESOLVED: grounding is a precision filter, not just an honesty label
+### SUPERSEDED by session 3 -- see RESULTS.md
+
+The claim below was made on n=2 (one planted repo, one clean repo) and does not
+survive n=30. Measured across the full benchmark: grounding rate 17.9% on
+injected repos vs 20.6% on clean controls -- indistinguishable. Grounding buys
+auditability, not precision. Kept here as a record of the error.
+
+### (superseded) grounding is a precision filter, not just an honesty label
 
 Measured on Falcon3-Mamba-7B-Instruct at 4k budget:
 
@@ -286,3 +293,33 @@ Do not write these until week 4 produces the numbers. Shape to aim for:
 Keep them honest. An interviewer will ask how the benchmark was built, what the
 negative controls were, and what the ungrounded rate was — and the honest answer
 to all three is the strongest part of the project.
+
+
+---
+
+# Session 3 -- COMPLETE. See `RESULTS.md`.
+
+30 audits, 40 planted vulnerabilities, 10 generated repositories.
+
+    precision 43.8%   recall 17.5%   F1 0.250
+    ablation  near 15.0% vs far 20.0%  ->  null result (-5.0%)
+    controls  34 proposed on clean repos, 7 grounded, 7 false positives
+
+Three things this run established:
+
+1. **A defensible number exists.** Seeded, reproducible, with negative controls,
+   and with detection separated from retrieval.
+2. **The graph-ordering ablation is null.** Reported as such.
+3. **The session-2 grounding claim was wrong.** It was built on two data points.
+   Correcting it is the most valuable output of the session.
+
+## If the project continues
+
+- **An L4 (22 GB) roughly doubles the ceiling** to ~10,400 tokens by the measured
+  memory model, which would admit real 15-36 KB libraries and let the ablation be
+  tested in the regime where it should actually matter.
+- **`pip install kernels`** for the fused selective-scan path. If it loads on
+  sm_75 the memory slope should collapse toward zero, which is the single
+  highest-leverage change available.
+- **More planted patterns.** Two patterns over 40 instances is thin; auth-bypass
+  and unsafe-deserialisation are already sketched in `eval/README.md`.
