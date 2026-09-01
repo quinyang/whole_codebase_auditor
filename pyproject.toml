@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wca"
-version = "0.10.1"
+version = "0.10.2"
 description = "Whole-Codebase Auditor: pure-SSM cross-file security analysis over a linear-time context pass"
 readme = "README.md"
 requires-python = ">=3.10"

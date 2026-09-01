@@ -539,8 +539,11 @@ def run_benchmark(
     usable = len({r.repo for r, _, _ in todo})
     print(f"{len(todo)} audits queued across {usable} repos\n")
 
+    from wca.infer import free_gpu
+
     for i, (repo_cases, variant, case) in enumerate(todo, 1):
         label = f"[{i}/{len(todo)}] {repo_cases.repo} :: {variant}"
+        free_gpu()  # hand the allocator's spare blocks back before each audit
         parsed = parse_files(case.files, LanguageDispatcher())
         graph = build_graph(parsed.files)
         packed = pack(

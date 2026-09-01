@@ -6,7 +6,7 @@ Each stage is importable and independently testable. Only `infer` requires a GPU
 or the `gpu` extra; everything up to and including `pack` runs on CPU.
 """
 
-__version__ = "0.10.1"
+__version__ = "0.10.2"
 
 
 def version_tuple(v: str | None = None) -> tuple[int, ...]:

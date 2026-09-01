@@ -230,15 +230,36 @@ def slow_path_bytes_per_token(model) -> int:
     return intermediate * state * 4 * n_live_tensors
 
 
+def available_bytes() -> int:
+    """VRAM actually usable for the next allocation.
+
+    `torch.cuda.mem_get_info()` reports memory free *on the device*, which is not
+    the same as memory available to torch. The caching allocator holds freed
+    blocks in reserve to reuse them, so after one generation the device looks
+    nearly full while torch has gigabytes it can hand straight back.
+
+    Using device-free alone made the guard tighten after every audit: the first
+    two runs of a 30-audit benchmark passed, then all 28 remaining were rejected
+    at ~2,100 tokens -- contexts that had just succeeded. Adding the reserved but
+    unallocated pool back is what makes the estimate stable across a run.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return 0
+    device_free, _total = torch.cuda.mem_get_info()
+    cached_spare = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+    return device_free + max(cached_spare, 0)
+
+
 def estimate_max_context(model, *, safety: float = 0.8) -> int:
-    """Largest context that fits in free VRAM on the eager path."""
+    """Largest context that fits in usable VRAM on the eager path."""
     import torch
 
     if not torch.cuda.is_available():
         return MODEL_MAX_CONTEXT
-    free, _total = torch.cuda.mem_get_info()
     per_token = slow_path_bytes_per_token(model)
-    return max(int(free * safety / per_token), 512)
+    return max(int(available_bytes() * safety / per_token), 512)
 
 
 def describe_environment() -> str:
@@ -375,13 +396,13 @@ class MambaAuditor:
             if n_prompt > safe:
                 per_tok = slow_path_bytes_per_token(self.model) / 2**20
                 need = n_prompt * per_tok / 1024
-                free = torch.cuda.mem_get_info()[0] / 2**30
+                free = available_bytes() / 2**30
                 raise RuntimeError(
                     f"Context of {n_prompt:,} tokens will not fit.\n"
                     f"  No fused kernel -> transformers uses slow_forward, which "
                     f"materialises a [batch, intermediate, seq_len, state] tensor.\n"
                     f"  Activation cost ~{per_tok:.2f} MiB/token -> "
-                    f"~{need:.1f} GiB needed, {free:.1f} GiB free.\n"
+                    f"~{need:.1f} GiB needed, {free:.1f} GiB usable.\n"
                     f"  Fixes, in order:\n"
                     f"    1. budget_tokens<={safe:,} (proves the pipeline now)\n"
                     f"    2. pip install kernels   (fused kernels, no source build)\n"
@@ -389,6 +410,10 @@ class MambaAuditor:
                     f"  Note: 4-bit quantisation does NOT help -- this is "
                     f"activation memory, not weights."
                 )
+
+        # Release the previous generation's activations before allocating the
+        # next. Without this, peak usage ratchets up across a long benchmark.
+        free_gpu()
 
         t0 = time.perf_counter()
         with torch.inference_mode():

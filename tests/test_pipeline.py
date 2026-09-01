@@ -966,3 +966,24 @@ def test_version_comparison_is_numeric_not_lexicographic():
     assert version_tuple("1.0.0") > version_tuple("0.99.0")
     assert version_tuple("0.10.1") > version_tuple("0.10.0")
     assert not version_tuple("0.9.0") > version_tuple("0.10.0")
+
+
+def test_available_bytes_counts_the_allocator_cache(monkeypatch):
+    """Device-free memory alone is not what torch can allocate. Counting only
+    device-free made the guard tighten after every audit -- two benchmark runs
+    passed, then 28 were rejected at context sizes that had just succeeded."""
+    import sys
+    import types
+
+    fake = types.ModuleType("torch")
+    fake.cuda = types.SimpleNamespace(
+        is_available=lambda: True,
+        mem_get_info=lambda: (1 * 2**30, 16 * 2**30),  # 1 GiB free on device
+        memory_reserved=lambda: 9 * 2**30,
+        memory_allocated=lambda: 4 * 2**30,  # 5 GiB reserved-but-spare
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake)
+
+    from wca.infer import available_bytes
+
+    assert available_bytes() == 6 * 2**30  # 1 device-free + 5 cached spare
